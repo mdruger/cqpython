@@ -21,9 +21,12 @@ from functools import wraps
 from itertools import chain, repeat
 from lxml.etree import XML, _Element
 from genshi.template import Context, MarkupTemplate, TemplateLoader, \
-                            TemplateNotFound
+                            TemplateNotFound, TextTemplate
 
-from onresolve.clearquest.api.distributed import distributed, Cluster
+from distributed import distributed, Cluster
+from util import joinPath
+import db
+from constants import *
 
 #===============================================================================
 # makepy Globals
@@ -63,6 +66,7 @@ class EntityCommitError(Exception): pass
 class UserUpgradeInfoError(Exception): pass
 class DatabaseApplyPropertyChangesError(Exception): pass   
 class DatabaseVendorNotSupported(Exception): pass
+class DatabaseVendorNotDiscernableFromConnectString(Exception): pass
 
 class DatabaseError(Exception):
     """
@@ -169,6 +173,29 @@ def getConnectString(db):
     else:
         raise DatabaseVendorNotSupported, DatabaseVendor[db.Vendor]
 
+
+#===============================================================================
+# Template Loaders (XML and SQL)
+#===============================================================================
+
+_XmlTemplateDir = joinPath(os.path.dirname(__file__), 'xml')
+_XmlLoader = TemplateLoader(_XmlTemplateDir, auto_reload=True)
+_SqlTemplateDir = joinPath(os.path.dirname(__file__), 'sql')
+_SqlLoader = TemplateLoader(_SqlTemplateDir, 
+                            default_class=TextTemplate,
+                            auto_reload=True)
+
+
+def _findSql(session, classOrModuleName, methodName, *args, **kwds):
+    vendor = session.getDbVendorName()
+    fileName = '%s.%s.%s.sql' % (classOrModuleName, methodName, vendor)
+    if not os.path.isfile(joinPath(_SqlTemplateDir, fileName)):
+        fileName = '%s.%s.sql' % (classOrModuleName, methodName)
+    
+    return _SqlLoader.load(fileName) \
+                     .generate(args=args, **kwds) \
+                     .render('text')
+
 #===============================================================================
 # Decorators 
 #===============================================================================
@@ -233,6 +260,35 @@ def xml(*args, **kwds):
         return newf
     return decorator
 
+def runSql(**kwds):
+    def decorator(f):
+        typename = kwds.get('returns', None)
+        @wraps(f)
+        def newf(*_args, **_kwds):
+            self = _args[0]
+            
+            session = self.session
+            className = self.__class__.__name__
+            m = f(*_args, **_kwds)
+            if isinstance(m, dict):
+                _kwds.update(m)
+            _kwds['this'] = self
+            sql = _findSql(session, className, f.func_name, *_args, **_kwds)
+            cursor = session.db().cursor()
+            cursor.execute(sql)
+            if typename in (int, str, unicode):
+                return typename(cursor.fetchone()[0])
+            elif typename in (list, tuple):
+                return cursor.fetchall()
+            elif typename is None:
+                return
+            else:
+                raise RuntimeError, "return type '%s' not supported" % \
+                                    typename.__name__
+                
+        return newf
+    return decorator
+
 def returns(typename, **kwds):
     def decorator(f):
         @wraps(f)
@@ -279,7 +335,6 @@ def raiseExceptionOnError(exceptionType):
     
 from win32com.client import DispatchBaseClass
 class CQObject(DispatchBaseClass):
-    _Loader = TemplateLoader(os.path.dirname(__file__), auto_reload=True)
     
     """
     When a child object is created via a @returns(typename) decorator, it will
@@ -316,10 +371,12 @@ class CQObject(DispatchBaseClass):
         return self.__dict__['_xml']
                 
     def _toXml(self, ns=CQXmlNamespaceUri):
-        return self._Loader.load(self.xmlFileName)                             \
-                          .generate(this=self, api=self.api, ns={'xmlns': ns}) \
-                          .render('xml')
-    
+        return self._XmlLoader.load(self.xmlFileName)                             \
+                              .generate(this=self,
+                                        api=self.api,
+                                        ns={'xmlns': ns}) \
+                              .render('xml')
+                          
     def saveXml(self):
         if self.__class__.__name__ == 'Entity':
             filename = self.GetEntityDefName() + '-' + \
@@ -485,44 +542,7 @@ class CQIterator(object):
     def next(self):
         return self.cast(self._iter.next())
         
-class DbConnection(object):
-    def __init__(self, connectString):
-        self._connectString = connectString
-        self._con = odbc.odbc(connectString)
-    
-    def _execute(self, sql):
-        cursor = self._con.cursor()
-        try:
-            cursor.execute(sql)
-        except (dbi.dataError,
-                dbi.integrityError,
-                dbi.internalError,
-                dbi.opError,
-                dbi.progError), details:
-            raise DatabaseError(details, sql)
-        return cursor
-    
-    def select(self, sql):
-        cursor = self._execute(sql)
-        single = len(cursor.description) == 1
-        for row in iter(lambda: cursor.fetchone(), None):
-            yield row[0] if single else row        
-    
-    def selectAll(self, sql):
-        cursor = self._execute(sql)
-        single = len(cursor.description) == 1
-        results = cursor.fetchall()
-        return results if not single else [ row[0] for row in results ]
-    
-    def selectSingle(self, sql):
-        cursor = self._execute(sql)
-        try:
-            return cursor.fetchone()[0]
-        except TypeError:
-            return None
-    
-    def __getattr__(self, attr):
-        return getattr(self._con, attr)
+
     
 class NormalBehaviour(object):
     def __init__(self, parent, *args, **kwds):
@@ -1217,7 +1237,7 @@ class AdminSession(CQObject):
 
     @cache
     def db(self):
-        return DbConnection(self.connectString())
+        return db.Connection(self.connectString())
     
     def addUsers(self, users, **props):
         if not users.__class__ == Users:
@@ -1576,6 +1596,12 @@ class DatabaseDesc(CQObject):
     }
     _prop_map_put_ = {
     }
+    
+    @cache
+    def getDatabasePhysicalName(self):
+        return re.findall('DATABASE=([^;]+).*$',
+                          self.GetDatabaseConnectString(),
+                          re.IGNORECASE)[0]
     
 
 class Databases(CQCollection):
@@ -2185,7 +2211,25 @@ class EntityDef(CQObject):
     
     def lookupDbIdByDisplayName(self, displayName):
         return self.getUniqueKey().lookupDbIdByDisplayName(displayName)
-        
+
+    @cache
+    @sql.selectSingle
+    def getFieldDbName(self, fieldDefName): pass
+    
+    @sql.execute
+    def disablePrimaryAndUniqueIndexes(self): pass
+    
+    @sql.execute
+    def enablePrimaryAndUniqueIndexes(self): pass
+    
+    @sql.execute
+    def disableAllIndexes(self): pass        
+    
+    @sql.execute
+    def enableAllIndexes(self): pass
+    
+    @sql.selectAll
+    def listIndexes(self): pass
 
 class EntityDefs(CQObject):
     CLSID = IID('{B9F132EB-96A9-11D2-B40F-00A0C9851B52}')
@@ -4600,7 +4644,7 @@ class Session(CQObject):
         
     @cache
     def db(self):
-        return DbConnection(self.connectString())
+        return db.Connection(self.connectString())
 
     def lookupEntityDisplayNameByDbId(self, entityDefName, dbid):
         return self.GetEntityDef(entityDefName) \
@@ -4692,6 +4736,18 @@ class Session(CQObject):
         while r.MoveNext() == FetchStatus.Success:
             rows.append([ r.GetColumnValue(i) for i in cols ])
         return rows
+    
+    @cache
+    def getDbVendorName(self):
+        connectString = self.connectString()
+        driver = re.findall('DRIVER=\{([^\}]+)\}.*$', connectString,
+                            re.IGNORECASE)[0].replace(' ', '')
+        for vendor in DatabaseVendor.values():
+            if vendor in driver:
+                return vendor
+        
+        raise DatabaseVendorNotDiscernableFromConnectString, connectString
+
     
 class User(CQObject):
     CLSID = IID('{B48005E4-CF24-11D1-B37A-00A0C9851B52}')
@@ -5417,192 +5473,6 @@ NamesToIIDMap = {
     'HistoryFields' : '{CE573C7A-3B54-11D1-B2BF-00A0C9851B52}',
 }
 
-class Dict(dict):
-    def __init__(self, **kwds):
-        dict.__init__(self)
-        self.__dict__.update(**kwds)
-    def __getattr__(self, name):
-        return self.__getitem__(name)
-    def __setattr__(self, name, value):
-        return self.__setitem__(name, value)    
-
-class CQConstant(Dict):
-    def __init__(self):
-        items = self.__class__.__dict__.items()
-        for (key, value) in filter(lambda t: t[0][:2] != '__', items):
-            self[value] = key
-
-class _ActionType(CQConstant):
-    Submit      = 1
-    Modify      = 2
-    ChangeState = 3
-    Duplicate   = 4
-    Unduplicate = 5
-    Import      = 6
-    Delete      = 7
-    Base        = 8
-    RecordScriptAlias = 9
-ActionType = _ActionType()
-
-class _AuthenticationAlgorithm(CQConstant):
-    CQFirst = 2
-    CQOnly  = 3
-AuthenticationAlgorithm = _AuthenticationAlgorithm()
-
-class _AuthenticationMode(CQConstant):
-    LDAP = 1
-    CQ   = 2
-AuthenticationMode = _AuthenticationMode()
-
-class _Behavior(CQConstant):
-    Mandatory   = 1
-    Optional    = 2
-    ReadOnly    = 3
-    UseHook     = 4
-Behavior = _Behavior()
-
-class _BoolOp(CQConstant):
-    And = 1
-    Or  = 2
-BoolOp = _BoolOp()
-
-class _ChoiceType(CQConstant):
-    Closed  = 1
-    Open    = 2
-ChoiceType = _ChoiceType()
-
-class _DatabaseVendor(CQConstant):
-    SQLServer   = 1
-    Access      = 2
-    SQLAnywhere = 3
-    Oracle      = 4
-    DB2         = 5
-DatabaseVendor = _DatabaseVendor()
-
-class _DbAggregate(CQConstant):
-    Count   = 1
-    Sum     = 2
-    Average = 3
-    Min     = 4
-    Max     = 5
-DbAggregate = _DbAggregate()
-
-class _DbFunction(CQConstant):
-    Day     = 1
-    Week    = 2
-    Month   = 3
-    Year    = 4
-DbFunction = _DbFunction()
-
-class _EntityStatus(CQConstant):
-    NotFound    = 1
-    Visible     = 2
-    Hidden      = 3
-EntityStatus = _EntityStatus()
-
-class _EntityType(CQConstant):
-    Stateful    = 1
-    Stateless   = 2
-    Any         = 3
-EntityType = _EntityType()
-
-class _EventType(CQConstant):
-    ButtonClick              = 1
-    SubdialogButtonClick     = 2
-    ItemSelection            = 3
-    ItemDoubleClick          = 4
-    ContextMenuItemSelection = 5
-    ContextMenuItemCondition = 6
-EventType = _EventType()
-
-class _FetchStatus(CQConstant):
-    Success     	= 1
-    NoDataFound     = 2
-    MaxRowsExceeded = 3
-FetchStatus = _FetchStatus()
-
-class _FieldType(CQConstant):
-    ShortString     = 1
-    MultilineString = 2
-    Integer         = 3
-    DateTime        = 4
-    Reference       = 5
-    ReferenceList   = 6
-    AttachmentList  = 7
-    Id              = 8
-    State           = 9
-    Journal         = 10
-    DbId            = 11
-    StateType       = 12
-    RecordType      = 13
-FieldType = _FieldType()
-FieldType.referenceTypes = (
-    FieldType.Reference,
-    FieldType.ReferenceList,
-    FieldType.AttachmentList,
-)
-FieldType.listTypes = (
-    FieldType.ReferenceList,
-    FieldType.AttachmentList,
-    FieldType.Journal, 
-)
-FieldType.readOnlyListTypes = (
-    FieldType.Journal,                               
-)
-FieldType.writeableListTypes = (
-    FieldType.ReferenceList,
-    FieldType.AttachmentList,
-)
-FieldType.scalarTypes = (
-    FieldType.ShortString,
-    FieldType.MultilineString,
-    FieldType.Integer,
-    FieldType.DateTime,
-    FieldType.Reference,
-    FieldType.Id,
-    FieldType.State,
-    FieldType.DbId,
-    FieldType.StateType,
-    FieldType.RecordType,
-)
-FieldType.readOnlyScalarTypes = (
-    FieldType.Id,
-    FieldType.DbId,
-    FieldType.State,
-    FieldType.StateType,
-    FieldType.RecordType,
-)
-FieldType.writeableScalarTypes = (
-    FieldType.ShortString,
-    FieldType.MultilineString,
-    FieldType.Integer,
-    FieldType.DateTime,
-    FieldType.Reference,
-)
-FieldType.uniqueKeyTypes = (
-    FieldType.ShortString,
-    FieldType.Integer,
-    FieldType.DateTime,
-    FieldType.Reference,
-    FieldType.DbId,
-)
-
-class _QueryType(CQConstant):
-    List    = 1
-    Report  = 2
-    Chart   = 3
-QueryType = _QueryType()
-
-class _ReturnString(CQConstant):
-    Local   = 1
-    Unicode = 2
-ReturnString = _ReturnString()
-
-class _SessionClassType(CQConstant):
-    User    = 1
-    Admin   = 2
-SessionClassType = _SessionClassType()
-
 SessionClassTypeMap = {
     SessionClassType.User  : Session,
     SessionClassType.Admin : AdminSession,
@@ -5612,62 +5482,6 @@ SessionClassTypeLogonMethod = {
     SessionClassType.User  : Session.UserLogon,
     SessionClassType.Admin : AdminSession.Logon,
 }
-
-class _SessionType(CQConstant):
-    Shared          = 1
-    Private         = 2
-    Admin           = 3
-    SharedMetadata  = 4
-SessionType = _SessionType()
-
-class _SortType(CQConstant):
-    Ascending   = 1
-    Descending  = 2
-SortType = _SortType()
-
-class _ValueStatus(CQConstant):
-    HasNoValue          = 1
-    HasValue            = 2
-    ValueNotAvailable   = 3
-ValueStatus = _ValueStatus()
-
-class _WorkspaceFolderType(CQConstant):
-    Public = 1
-    Personal = 2
-WorkspaceFolderType = _WorkspaceFolderType()
-
-class _WorkspaceItemType(CQConstant):
-    Query              = 1
-    Chart              = 2
-    Folder             = 3
-    Favorites          = 5
-    QueryParameters    = 6
-    Preferences        = 7
-    Report             = 9
-    ReportFormat       = 10
-    StartupBucketArray = 11    
-WorkspaceItemType = _WorkspaceItemType()
-
-WorkspaceItemTypeMap = {
-    WorkspaceItemType.Query  : 'QueryDef',
-    WorkspaceItemType.Chart  : 'QueryDef',
-    WorkspaceItemType.Folder : 'Folder',
-}
-
-class _WorkspaceNameOption(CQConstant):
-    NotExtended = 1
-    Extended = 2
-    ExtendedWhenNeeded = 3
-WorkspaceNameOption = _WorkspaceNameOption()
-
-class _UserPrivilegeMaskType(CQConstant):
-    DynamicListAdmin    = 1
-    PublicFolderAdmin   = 2
-    SecurityAdmin       = 3
-    RawSQLWriter        = 4
-    AllUsersVisible     = 5
-    MultiSiteAdmin      = 6
-UserPrivilegeMaskType = _UserPrivilegeMaskType()
 
 
 class constants:
