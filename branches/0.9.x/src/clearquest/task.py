@@ -1,5 +1,5 @@
 """
-clearquest.tasks: module for simplifying ClearQuest migrations.
+clearquest.task: module for simplifying ClearQuest migrations.
 """
 
 #===============================================================================
@@ -13,6 +13,7 @@ import inspect
 import traceback
 import api
 import callback
+from util import joinPath, Dict, spliceWork
 
 from functools import wraps
 from itertools import repeat
@@ -24,6 +25,7 @@ from lxml.etree import XML
 # Globals
 #===============================================================================
 __rcsid__ = '$Id$'
+__rcsurl__ = '$URL$'
 __copyright__ = 'Copyright 2008 OnResolve Ltd'
 
 #===============================================================================
@@ -33,9 +35,6 @@ __copyright__ = 'Copyright 2008 OnResolve Ltd'
 #===============================================================================
 # Helper Methods
 #===============================================================================
-
-def joinPath(*args):
-    return os.path.normpath(os.path.join(*args))
 
 def copyUsers(src, dst):
     users = src.Users
@@ -50,15 +49,6 @@ def copyUsers(src, dst):
     created = len(users) - len(failed)
     print "created %d users in %s seconds\nfailed: %s" % \
           (created, str(stopTime - startTime), ", ".join(failed))
-
-def spliceWork(data, nchunks):
-    size = len(data) / nchunks
-    results = []
-    results.append((0, size))
-    for i in range(1, nchunks-1):
-        results.append((i*size, (i+1)*size))
-    results.append(((nchunks-1)*size, len(data)-1))
-    return results
 
 #===============================================================================
 # Classes
@@ -707,3 +697,13 @@ class UpdateDynamicListsTask(Task):
                 cb.failed += 1                
         cb.finished()
 
+class MergeManager(TaskManager):
+    def __init__(self, manager):
+        Task.__init__(self, manager)
+
+    def getSessionClassType(self):
+        return api.SessionClassType.User
+    
+    def run(self):
+        cb = self.cb
+        
