@@ -1,5 +1,5 @@
 
-from util import Dict
+from clearquest.util import Dict
 
 class CQConstant(Dict):
     def __init__(self):

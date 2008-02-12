@@ -1,15 +1,8 @@
 INSERT INTO ${dstTable} (
-${dbFieldNames}
+    ${dstColumns}
 )
 SELECT
-${dbFieldNames}
+    ${srcColumns}
 FROM
-    ${srcTable}
-WHERE
-    dbid <> 0
-#if start
-    AND dbid >= ${start}
-#end
-#if end
-    AND dbid <= ${end}
-#end
+    ${srcTable} src
+${where}
