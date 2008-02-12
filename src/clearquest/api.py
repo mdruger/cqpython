@@ -3,6 +3,7 @@
 # By python version 2.5.1 (r251:54863, May  1 2007, 17:47:05) [MSC v.1310 32 bit (Intel)]
 # From type library 'cqole.dll'
 # On Fri Nov 02 19:34:26 2007
+from clearquest.util import connectStringToMap
 """"""
 makepy_version = '0.4.95'
 python_version = 0x20501f0
@@ -10,8 +11,6 @@ python_version = 0x20501f0
 import os
 import re
 import sys
-import dbi
-import odbc
 import time
 import win32com.client.CLSIDToClass, pythoncom
 import win32com.client.util
@@ -23,10 +22,11 @@ from lxml.etree import XML, _Element
 from genshi.template import Context, MarkupTemplate, TemplateLoader, \
                             TemplateNotFound, TextTemplate
 
-from distributed import distributed, Cluster
-from util import joinPath
-import db
-from constants import *
+from clearquest import db
+from clearquest.distributed import distributed, Cluster
+from clearquest.constants import *
+from clearquest.util import cache, concat, Dict, iterable, joinPath, listToMap,\
+                            symbols, symbolMap, toList
 
 #===============================================================================
 # makepy Globals
@@ -68,42 +68,6 @@ class DatabaseApplyPropertyChangesError(Exception): pass
 class DatabaseVendorNotSupported(Exception): pass
 class DatabaseVendorNotDiscernableFromConnectString(Exception): pass
 
-class DatabaseError(Exception):
-    """
-    Helper class for wrapping any DBI error we may encounter in a single class.
-    """
-    def __init__(self, details, sql):
-        self.args = (details, "Offending SQL:\n%s" % sql)
-        
-
-#===============================================================================
-# Helper Methods 
-#===============================================================================
-
-def listToMap(l):
-    return dict(zip(l, repeat(1)))
-
-def symbols(c):
-    return [ s for s in dir(c) if not s.startswith('_') ]
-
-def symbolMap(c):
-    return listToMap(symbols(c))
-
-def toList(l):
-    return [l] if not type(l) == list else l
-
-def iterable(i):
-    return (i,) if not hasattr(i, '__iter__') else i
-
-def concat(arg1, *other):
-    if not other:
-        return arg1
-    args = [arg1] + list(other)
-    s = ["{fn CONCAT(%s, %s)}" % ((args.pop(len(args)-2), args.pop()))]
-    for v in reversed(args):
-        s.insert(0, "{fn CONCAT(%s, " % v)
-        s.append(")}")
-    return "".join(s)
 
 def extractLogonArgs(sessionClassType, d):
     if sessionClassType == SessionClassType.User:
@@ -199,34 +163,6 @@ def _findSql(session, classOrModuleName, methodName, *args, **kwds):
 #===============================================================================
 # Decorators 
 #===============================================================================
-
-def cache(f):
-    @wraps(f)
-    def newf(*_args, **_kwds):
-        self = _args[0]
-        cacheName = '_cache_' + f.func_name
-        if not hasattr(self, cacheName):
-            self.__dict__[cacheName] = dict()
-        cache = self.__dict__[cacheName]
-        id = '%s,%s' % (repr(_args[1:]), repr(_kwds))
-        if not id in cache:
-            # If there's a method with the same name but prefixed with a '_',
-            # use this to derive the cacheable value.  Otherwise, use the method
-            # we've been asked to decorate.  We take this approach to support
-            # certain API methods that need to be wrapped with @returns, which
-            # makes them unsuitable to also be wrapped with @cache.  In these
-            # situations, the public API method will be an empty 'pass' block
-            # with a @cache decorator, and the actual API method wrapped with
-            # @returns(<typename>) with be prefixed with a '_'.
-            if hasattr(self, '_' + f.func_name):
-                args = _args[1:]
-                method = getattr(self, '_' + f.func_name)
-            else:
-                args = _args
-                method = f
-            cache[id] = method(*args, **_kwds)
-        return cache[id]
-    return newf
 
 def xml(*args, **kwds):
     if not args:
@@ -807,45 +743,38 @@ class DeferredWriteSchemaObjectProxy(SchemaObjectProxy):
                                    *args, **kwds)
 
 class UniqueKey(object):
-    _selectUniqueKeyFieldsSql = """
-        SELECT
-            f.name,
-            f.db_name
-        FROM
-            fielddef f,
-            entitydef e,
-            unique_key_def u
-        WHERE
-            f.id = u.fielddef_id AND
-            e.id = u.entitydef_id AND
-            e.id = f.entitydef_id AND
-            e.name = '%s'
-        ORDER BY
-            u.sequence ASC
-    """
     
     def __init__(self, entityDef, depth=0):
-        self._entityDef = entityDef
-        self._session = entityDef.session
+        self.session = entityDef.session
+        self.entityDef = entityDef
         self._depth = 0
         
     def lookupDisplayNameByDbId(self, dbid):
-        sql = self._buildSql(where='t1.dbid') % dbid
-        return self._session.db().selectSingle(sql)
+        sql = self._buildSql(where='t1.dbid')
+        return self.session.db().selectSingle(sql, dbid)
     
     def lookupDbIdByDisplayName(self, displayName):
-        sql = self._buildSql(select='t1.dbid') % "'" + displayName + "'"
-        return self._session.db().selectSingle(sql)
+        sql = self._buildSql(select='t1.dbid')
+        return self.session.db().selectSingle(sql, displayName)
             
     @cache
-    def fields(self):
-        sql = self._selectUniqueKeyFieldsSql % self._entityDef.GetName()
-        return self._session.db().selectAll(sql)
+    @db.selectAll
+    def selectFields(self):
+        return self.entityDef.GetName()
+
+    @cache
+    def getEntityTableName(self):
+        csm = connectStringToMap(self.session.connectString())
+        return '%s.%s.%s' % (
+            csm['DATABASE'],
+            csm['UID'],
+            self.entityDef.GetDbName(),
+        )
 
     @cache
     def _info(self, depth=1, visited=dict()):
         alias = 't' + str(depth)
-        entityDef = self._entityDef
+        entityDef = self.entityDef
         entityDefName = entityDef.GetName()
         
         # Reset our visited dict if we're starting from scratch.
@@ -870,9 +799,9 @@ class UniqueKey(object):
         where = []
         fields = []
         
-        joins.append('%s %s' % (entityDef.GetDbName(), alias))
+        joins.append('%s %s' % (self.getEntityTableName(), alias))
         
-        for field, dbname in self.fields():
+        for field, dbname in self.selectFields():
             if entityDef.GetFieldDefType(field) != FieldType.Reference:
                 fields.append('%s.%s' % (alias, dbname))
             else:
@@ -911,7 +840,7 @@ class UniqueKey(object):
         
         return 'SELECT %s FROM %s WHERE %s AND %s = ' % \
                 (kwds.get('select', displayNameSql), joins, where,
-                 kwds.get('where', displayNameSql)) + '%s'
+                 kwds.get('where', displayNameSql)) + '?'
 
 class DynamicList(object):
     _xmlTemplate =  MarkupTemplate(                                            \
@@ -2213,22 +2142,22 @@ class EntityDef(CQObject):
         return self.getUniqueKey().lookupDbIdByDisplayName(displayName)
 
     @cache
-    @sql.selectSingle
+    @db.selectSingle
     def getFieldDbName(self, fieldDefName): pass
     
-    @sql.execute
+    @db.execute
     def disablePrimaryAndUniqueIndexes(self): pass
     
-    @sql.execute
+    @db.execute
     def enablePrimaryAndUniqueIndexes(self): pass
     
-    @sql.execute
+    @db.execute
     def disableAllIndexes(self): pass        
     
-    @sql.execute
+    @db.execute
     def enableAllIndexes(self): pass
     
-    @sql.selectAll
+    @db.selectAll
     def listIndexes(self): pass
 
 class EntityDefs(CQObject):
@@ -4641,7 +4570,7 @@ class Session(CQObject):
     @cache
     def connectString(self):
         return self.GetSessionDatabase().GetDatabaseConnectString()
-        
+
     @cache
     def db(self):
         return db.Connection(self.connectString())
@@ -4747,7 +4676,31 @@ class Session(CQObject):
                 return vendor
         
         raise DatabaseVendorNotDiscernableFromConnectString, connectString
+    
+    @cache
+    def getAllEntityDefs(self):
+        return [ self.GetEntityDef(n) for n in self.GetEntityDefNames() ]
+    
+    @cache
+    def getStatefulEntityDefs(self):
+        return [
+            entityDef for entityDef in self.getAllEntityDefs()
+                if entityDef.GetType() == EntityType.Stateful
+        ]
+        
+    @cache
+    def getStatelessEntityDefs(self):
+        return [
+            entityDef for entityDef in self.getAllEntityDefs()
+                if entityDef.GetType() == EntityType.Stateless
+        ]
 
+    def disableAllEntityIndexes(self):
+        dummy = [ e.disableAllIndexes() for e in self.getAllEntityDefs() ]
+        
+    def enableAllEntityIndexes(self):
+        dummy = [ e.enableAllIndexes() for e in self.getAllEntityDefs() ]
+        
     
 class User(CQObject):
     CLSID = IID('{B48005E4-CF24-11D1-B37A-00A0C9851B52}')

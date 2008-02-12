@@ -86,12 +86,20 @@ class ConsoleCallback(Callback):
         if 'pydevd' in sys.modules:
             self.write('\n')
     
+    def _report(self, name):
+        info = getattr(self, '_' + name)
+        if info:
+            self.write('\n%s:' % name)
+            for (id, backtrace) in info.items():
+                self.write('\n%s:\n\t%s' % \
+                    (id, '\n\t'.join([
+                        b.replace('\n', '\n\t') for b in backtrace 
+                    ]))
+                )
+            self.write('\n')
+    
     def finished(self):
-        from pprint import pformat
         Callback.finished(self)
-        if self._warnings:
-            self.write("\nwarnings:\n%s" % pformat(self._warnings))
+        self._report('warnings')
+        self._report('errors')
         
-        if self._errors:
-            self.write("\nerrors:\n%s" % pformat(self._errors))
-
