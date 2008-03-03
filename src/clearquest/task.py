@@ -8,7 +8,7 @@ clearquest.task: module for simplifying ClearQuest migrations.
 
 import os, sys, time, traceback
 
-from itertools import repeat
+from itertools import count, repeat
 
 from lxml.etree import XML
 from os.path import basename, dirname
@@ -67,13 +67,17 @@ class Config(ConfigParser):
         return option
     
     def __getitem__(self, name):
-        return self.data[name]
+        try:
+            return self.data[name]
+        except KeyError:
+            return self.default[name]
     
 class TaskManagerConfig(Config):
-    def __init__(self, manager):
+    def __init__(self, manager, file=None):
         self.manager = manager
-        base = basename(sys.modules[manager.__module__].__file__)
-        file = joinPath(manager.runDir, base[:base.rfind('.')] + '.ini')
+        if not file:
+            base = basename(sys.modules[manager.__module__].__file__)
+            file = joinPath(manager.runDir, base[:base.rfind('.')] + '.ini')
         Config.__init__(self, file)
         
     def getDefaultConfigSection(self):
@@ -108,33 +112,34 @@ class TaskManagerConfig(Config):
                 raise error
             else:
                 return default
+    
+    @cache
+    def toDict(self):
+        m = self.defaults()
+        m.update(**dict(self.items(self.getDefaultConfigSection())))
+        return m
 
 class TaskManager(object):
-    def __init__(self):
-        self.runDir = dirname(sys.modules['__main__'].__file__)
+    def __init__(self, runDir=dirname(sys.modules['__main__'].__file__)):
+        self.runDir = runDir
         self.conf = self.createConfig()
-        
-        # Need to modify to support arbitrary tasks in any module, not just
-        # those present in the source module.
-        self.tasks = self.conf.tasks()
-        self.task = dict()
         
         callbackType = self.conf.get('callback', 'ConsoleCallback')
         self.cb = getattr(callback, callbackType)(self)
-    
-    def createConfig(self):
-        return TaskManagerConfig(self)
         
-    def run(self):
-        raise NotImplementedError
-    
+        # Need to modify to support arbitrary tasks in any module, not just
+        # those present in the source module.
+        self._taskCount = count(0)
+        self.tasks = self.conf.tasks()
+        self.task = dict()
+        
     @cache
     def getSourceConf(self):
-        return self.conf[self.conf.sourceTarget]
+        return self.conf[self.sourceTarget]
     
     @cache
     def getDestConf(self):
-        return self.conf[self.conf.destTarget]
+        return self.conf[self.destTarget]
     
     def _getSession(self, sessionClassType, conf):
         if sessionClassType == api.SessionClassType.User:
@@ -154,7 +159,15 @@ class TaskManager(object):
     
     @cache
     def getDestSession(self, sessionClassType):
-        return self._getSession(sessionClassType, self.getDestConf())
+        return self._getSession(sessionClassType, self.getDestConf())    
+    
+    def createConfig(self):
+        return TaskManagerConfig(self)
+        
+    def run(self):
+        raise NotImplementedError
+    
+
     
 class Task(object):
     def __init__(self, manager):
@@ -169,7 +182,9 @@ class Task(object):
         a Dict interface through self.data.
         """
         self.data = self._data()
-    
+        
+        self.id = self.manager._taskCount.next()
+        
     def getSessionClassType(self):
         """
         @return: a value corresponding to api.SessionClassType (either User or
@@ -183,6 +198,55 @@ class Task(object):
         to whatever callback class the parent TaskManager is using.
         """
         return self.manager.cb.__class__(self)
+    
+    def previous(self):
+        """
+        @returns: the task that ran previous to us, or None if we're the first
+        task.
+        """
+        try:
+            return self.manager.task[self.manager.tasks[self.id-1].__name__]
+        except IndexError:
+            return None
+    
+    def next(self):
+        """
+        @returns: the task that's meant to be run after we complete, or None
+        if we're the last task.
+        """
+        try:
+            return self.manager.task[self.manager.tasks[self.id+1].__name__]
+        except IndexError:
+            return None
+    
+    def completed(self):
+        """
+        If the parent Task Manager supports it, this method will be called when
+        the task's run() method completes successfully.  If the task supports
+        rollbackToCompletionPoint(), it is likely it will need to perform some 
+        sort of action here to save the state.
+        """
+        pass
+    
+    def failed(self):
+        """
+        If the parent Task Manager supports it, this method will be called when
+        the task's run() method completes successfully.  By default, it calls
+        the previous task's rollbackToCompletionPoint() method.
+        """
+        try:
+            self.previous().rollbackToCompletionPoint()
+        except AttributeError:
+            pass
+            
+    
+    def rollbackToCompletionPoint(self):
+        """
+        If a task execution after us fails, we may be called on to rollback to
+        the point at which we were complete; i.e. restoring a database to a
+        snapshot we took when complete() was called. 
+        """
+        pass
     
     def run(self):
         pass

@@ -19,7 +19,7 @@ from ConfigParser import ConfigParser, NoOptionError
 from lxml.etree import XML
 
 from clearquest import api, callback
-from clearquest.util import joinPath, Dict, spliceWork
+from clearquest.util import cache, joinPath, Dict, spliceWork
 from clearquest.task import CreateSchemaObject, Task, TaskManager, \
                             TaskManagerConfig
 
