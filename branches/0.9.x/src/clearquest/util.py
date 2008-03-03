@@ -7,6 +7,7 @@ clearquest.util: module for any miscellaneous utilities (methods, classes etc)
 #===============================================================================
 
 import os
+from inspect import ismethod
 from functools import wraps
 from itertools import repeat
 
@@ -51,7 +52,15 @@ def joinPath(*args):
     return os.path.normpath(os.path.join(*args))
 
 def connectStringToMap(connectString):
-    return dict([ v.split('=') for v in connectString.split(';') ])
+    m = dict([ v.split('=') for v in connectString.split(';') ])
+    if 'DATABASE' in m:
+        m['DB'] = m['DATABASE']
+    elif 'DB' in m:
+        m['DATABASE'] = m['DB']
+    else:
+        raise ValueError, "could not find value for 'DB' or 'DATABASE' in " \
+                          "connection string"
+    return m
 
 def spliceWork(dataOrSize, nchunks):
     if type(dataOrSize) in (list, tuple):
@@ -69,7 +78,6 @@ def spliceWork(dataOrSize, nchunks):
 #===============================================================================
 # Decorators
 #===============================================================================
-
 def cache(f):
     @wraps(f)
     def newf(*_args, **_kwds):
@@ -98,6 +106,39 @@ def cache(f):
         return cache[id]
     return newf
 
+def cache2(f):
+    @wraps(f)
+    def newf(*_args, **_kwds):
+        self = _args[0] if _args else None
+        try:
+            if ismethod(getattr(self, f.func_name)):
+                c = self.__dict__
+        except:
+            c = f.__dict__
+        
+        cache = c.setdefault('_cache_%s' % f.func_name, dict())
+        id = '%s,%s' % (repr(_args[1:]), repr(_kwds))
+        
+        if not id in cache:
+            # If there's a method with the same name but prefixed with a '_',
+            # use this to derive the cacheable value.  Otherwise, use the method
+            # we've been asked to decorate.  We take this approach to support
+            # certain API methods that need to be wrapped with @returns, which
+            # makes them unsuitable to also be wrapped with @cache.  In these
+            # situations, the public API method will be an empty 'pass' block
+            # with a @cache decorator, and the actual API method wrapped with
+            # @returns(<typename>) with be prefixed with a '_'.
+            if self:
+                if hasattr(self, '_' + f.func_name):
+                    args = _args[1:]
+                    method = getattr(self, '_' + f.func_name)
+                else:
+                    args = _args
+                    method = f
+            cache[id] = method(*args, **_kwds)
+        return cache[id]
+    return newf
+
 
 #===============================================================================
 # Classes
@@ -111,4 +152,5 @@ class Dict(dict):
         return self.__getitem__(name)
     def __setattr__(self, name, value):
         return self.__setitem__(name, value)    
+        
 

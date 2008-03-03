@@ -23,6 +23,7 @@ from genshi.template import Context, MarkupTemplate, TemplateLoader, \
                             TemplateNotFound, TextTemplate
 
 from clearquest import db
+from clearquest.db import selectAll, selectSingle, getConnectOptionsFromRegistry
 from clearquest.distributed import distributed, Cluster
 from clearquest.constants import *
 from clearquest.util import cache, concat, Dict, iterable, joinPath, listToMap,\
@@ -65,9 +66,12 @@ class EntityValidationError(Exception): pass
 class EntityCommitError(Exception): pass
 class UserUpgradeInfoError(Exception): pass
 class DatabaseApplyPropertyChangesError(Exception): pass   
-class DatabaseVendorNotSupported(Exception): pass
 class DatabaseVendorNotDiscernableFromConnectString(Exception): pass
+class SchemaNameNotFoundError(Exception): pass
 
+#===============================================================================
+# Miscellaneous Helper Methods
+#===============================================================================
 
 def extractLogonArgs(sessionClassType, d):
     if sessionClassType == SessionClassType.User:
@@ -116,49 +120,12 @@ def addWorkspaceItemNature(object=None, **kwds):
     if object is None:
         return k
 
-def getConnectString(db):
-    """
-    @param db: instance of a Database object.
-    @return: string representing an ODBC connect string suitable for passing
-    to odbc.odbc().
-    """
-    class _wrap(object):
-        def __init__(self, obj):
-            self._obj = obj
-        def __getitem__(self, item):
-            return getattr(self._obj, item)
-        
-    if db.Vendor == DatabaseVendor.Oracle:
-        return "Driver={Rational DataDirect 5.X Oracle Wire Protocol};" \
-               "UID=%(DBOLogin)s;PWD=%(DBOPassword)s;HostName=%(Server)s;" \
-               "PortNumber=1521;SID=%(DatabaseName)s;" \
-               "codePageOverride=106;ReportCodePageConversionErrors=1" % \
-               _wrap(db)
-    else:
-        raise DatabaseVendorNotSupported, DatabaseVendor[db.Vendor]
-
-
 #===============================================================================
-# Template Loaders (XML and SQL)
+# XML Template Loader
 #===============================================================================
 
 _XmlTemplateDir = joinPath(os.path.dirname(__file__), 'xml')
 _XmlLoader = TemplateLoader(_XmlTemplateDir, auto_reload=True)
-_SqlTemplateDir = joinPath(os.path.dirname(__file__), 'sql')
-_SqlLoader = TemplateLoader(_SqlTemplateDir, 
-                            default_class=TextTemplate,
-                            auto_reload=True)
-
-
-def _findSql(session, classOrModuleName, methodName, *args, **kwds):
-    vendor = session.getDbVendorName()
-    fileName = '%s.%s.%s.sql' % (classOrModuleName, methodName, vendor)
-    if not os.path.isfile(joinPath(_SqlTemplateDir, fileName)):
-        fileName = '%s.%s.sql' % (classOrModuleName, methodName)
-    
-    return _SqlLoader.load(fileName) \
-                     .generate(args=args, **kwds) \
-                     .render('text')
 
 #===============================================================================
 # Decorators 
@@ -193,35 +160,6 @@ def xml(*args, **kwds):
             obj = getattr(self, method)(*[ xml.get(arg) for arg in args ])
             obj.applyXml(xml, **props)
             return obj
-        return newf
-    return decorator
-
-def runSql(**kwds):
-    def decorator(f):
-        typename = kwds.get('returns', None)
-        @wraps(f)
-        def newf(*_args, **_kwds):
-            self = _args[0]
-            
-            session = self.session
-            className = self.__class__.__name__
-            m = f(*_args, **_kwds)
-            if isinstance(m, dict):
-                _kwds.update(m)
-            _kwds['this'] = self
-            sql = _findSql(session, className, f.func_name, *_args, **_kwds)
-            cursor = session.db().cursor()
-            cursor.execute(sql)
-            if typename in (int, str, unicode):
-                return typename(cursor.fetchone()[0])
-            elif typename in (list, tuple):
-                return cursor.fetchall()
-            elif typename is None:
-                return
-            else:
-                raise RuntimeError, "return type '%s' not supported" % \
-                                    typename.__name__
-                
         return newf
     return decorator
 
@@ -477,8 +415,6 @@ class CQIterator(object):
         return self
     def next(self):
         return self.cast(self._iter.next())
-        
-
     
 class NormalBehaviour(object):
     def __init__(self, parent, *args, **kwds):
@@ -756,6 +692,26 @@ class UniqueKey(object):
     def lookupDbIdByDisplayName(self, displayName):
         sql = self._buildSql(select='t1.dbid')
         return self.session.db().selectSingle(sql, displayName)
+    
+    def _lookupDbIdFromForeignSessionSql(self, dbid, otherSession):
+        # TODO: we should probably assert that our current session and the other
+        # session are using identical schemas and database vendors.
+        collateTo = False
+        if self.session.getDatabaseVendor()==DatabaseVendor.SQLServer  and \
+            self.session.getCollation() != otherSession.getCollation() and \
+            self.hasTextColumnsInKey():
+                collateTo = self.session.getCollation()
+                
+        dstSql = self._buildSql(select='t1.dbid')[:-1]
+        srcSql = otherSession.GetEntityDef(self.entityDef.GetName()) \
+                             .getUniqueKey()                         \
+                             ._buildSql(where='t1.dbid')[:-1]
+        if collateTo:
+            srcSql = srcSql.replace('FROM', 'COLLATE %s FROM' % collateTo)
+        
+        if isinstance(dbid, (int, long)):
+            dbid = str(dbid)
+        return '%s(%s%s)' % (dstSql, srcSql, dbid)
             
     @cache
     @db.selectAll
@@ -795,6 +751,7 @@ class UniqueKey(object):
         else:
             visited[entityDefName] = depth
         
+        text = []
         joins = []
         where = []
         fields = []
@@ -802,8 +759,11 @@ class UniqueKey(object):
         joins.append('%s %s' % (self.getEntityTableName(), alias))
         
         for field, dbname in self.selectFields():
-            if entityDef.GetFieldDefType(field) != FieldType.Reference:
+            fieldType = entityDef.GetFieldDefType(field) 
+            if fieldType != FieldType.Reference:
                 fields.append('%s.%s' % (alias, dbname))
+                if fieldType in FieldType.textTypes:
+                    text.append((alias, dbname))
             else:
                 info = entityDef.GetFieldReferenceEntityDef(field) \
                                 .getUniqueKey() \
@@ -812,13 +772,19 @@ class UniqueKey(object):
                 joins += info['joins']
                 where += info['where']
                 where.append('%s.%s = %s.dbid' % (alias, dbname, info['alias']))
+                text += info['text']
         
         return {
             'alias'  : alias,
             'joins'  : joins,
             'where'  : where,
             'fields' : fields,
+            'text'   : text,
         }
+    
+    @cache
+    def hasTextColumnsInKey(self):
+        return bool(self._info()['text'])
     
     @cache
     def _getDisplayNameSql(self):
@@ -828,7 +794,7 @@ class UniqueKey(object):
             return concat(*[f for f in chain(*zip(fs[:-1], r))] + [fs[-1]])
         except IndexError:
             return fs[0]
-
+    
     @cache
     def _buildSql(self, **kwds):
         
@@ -951,7 +917,8 @@ class AdminSession(CQObject):
     
     #@distributed
     def __init__(self, *args, **kwds):
-        self.__dict__['adminSession'] = self
+        self.__dict__['session'] = self
+        self.__dict__['_databaseName'] = 'MASTR'
         CQObject.__init__(self, *args)
 
     def AddSchemaRepoLocationFile(self, filePath=defaultNamedNotOptArg):
@@ -1110,6 +1077,9 @@ class AdminSession(CQObject):
         return self._oleobj_.InvokeTypes(30, LCID, 1, (11, 0), (),)
 
     def Logon(self, Name=defaultNamedNotOptArg, password=defaultNamedNotOptArg, masterDbName=defaultNamedNotOptArg):
+        self.__dict__['_loginName'] = Name
+        self.__dict__['_password'] = password,
+        self.__dict__['_databaseSet'] = masterDbName
         return self._oleobj_.InvokeTypes(12, LCID, 1, (24, 0), ((8, 0), (8, 0), (8, 0)),Name
             , password, masterDbName)
 
@@ -1153,20 +1123,55 @@ class AdminSession(CQObject):
         "Users" : ((1, LCID, 4, 0),()),
     }
     
-    def connectString(self):
-        mastr = None
-        dbs = self.Databases
-        for db in dbs:
-            if db.Name == 'MASTR':
-                mastr = db
-                break
-        if mastr is None:
-            raise RuntimeError, "no 'MASTR' database found"
-        return getConnectString(mastr)
-
+    @cache
+    def connectOptions(self, name='MASTR'):
+        return ';'.join([
+            c for c in getConnectOptionsFromRegistry(self._databaseSet, name)
+                if c.startswith(('INSTANCE', 'PORT'))
+        ])
+    
+    @cache
+    def connectString(self, name='MASTR'):
+        connectOptions = self.connectOptions(name)
+        class _wrap(object):
+            def __init__(self, obj):
+                self._obj = obj
+                self._obj.__dict__['ConnectOptions'] = connectOptions
+            def __getitem__(self, item):
+                return getattr(self._obj, item)
+        
+        db = self.GetDatabase(name)
+        if not db:
+            raise ValueError, "Unknown database name: '%s'" % name
+            
+        if db.Vendor == DatabaseVendor.Oracle:
+            return "Driver={Rational DataDirect 5.X Oracle Wire Protocol};"    \
+                   "UID=%(DBOLogin)s;PWD=%(DBOPassword)s;HostName=%(Server)s;" \
+                   "SID=%(DatabaseName)s;%(ConnectOptions)s" %                 \
+                   _wrap(db)
+        elif db.Vendor == DatabaseVendor.SQLServer:
+            return "Driver={SQL Server};UID=%(DBOLogin)s;PWD=%(DBOPassword)s;" \
+                   "SERVER=%(Server)s;DATABASE=%(DatabaseName)s;"              \
+                   "%(ConnectOptions)s" %                                      \
+                   _wrap(db)
+        elif db.Vendor == DatabaseVendor.DB2:
+            cs = "Driver={Rational DataDirect 5.X DB2 Wire Protocol};"         \
+                 "UID=%(DBOLogin)s;PWD=%(DBOPassword)s;IP=%(Server)s;"         \
+                 "DB=%(DatabaseName)s;%(ConnectOptions)s" %                    \
+                  _wrap(db)
+            if 'PORT=' not in cs:
+                cs += ';PORT=50000'
+            return cs
+        elif db.Vendor == DatabaseVendor.Access:
+            return "Driver={Microsoft Access Driver (*.mdb)};"                 \
+                   "DBQ=%(DatabaseName)s" %                                    \
+                   _wrap(db)
+        else:
+            raise db.DatabaseVendorNotSupported, DatabaseVendor[db.Vendor]        
+    
     @cache
     def db(self):
-        return db.Connection(self.connectString())
+        return db.Connection(self)
     
     def addUsers(self, users, **props):
         if not users.__class__ == Users:
@@ -1184,7 +1189,83 @@ class AdminSession(CQObject):
             else:
                 user = self.CreateUser(name)
             user.applyXml(userXml, **props)
-             
+    
+    @cache
+    def getSchema(self, name):
+        schemas = self.Schemas
+        i = 0
+        found = False
+        schema = None
+        count = schemas.Count
+        while i < count:
+            schema = schemas[i]
+            if schema.Name == name:
+                found = True
+                break
+            i += 1
+        
+        if not found:
+            raise ValueError, "no schema named '%s' found"
+        else:
+            return schema
+        
+    
+    def createDatabase(self, logicalName, dbName, schemaName, schemaRev,**kwds):
+        """
+        @param logicalName: L{string} logical name of the database (e.g. CLSIC).
+        @param databaseName: L{string} physical name of the database
+        @param databaseVendorName:
+                    L{string} name of the vendor (should correspond to the 
+                    string values present in L{constants.DatabaseVendor}.
+        @param databaseLogin: L{string} database login name
+        @param databasePassword: L{string} password for the account above
+        @param serverName: L{string} database server name
+        @param description: L{string} description of the database
+        @param schemaName:
+                    L{string} name of the schema to use for the new database
+                    (L{ValueError} is thrown if the schema name can not be 
+                    found)
+        @param **kwds: Optional parameters are as follows:
+               'databaseLogin'      
+               'databasePassword'
+               'description'
+               'databaseVendorName': L{constants.DatabaseVendor}
+               'databaseServer' 
+        """
+        schema = self.getSchema(schemaName)
+        revision = schema.getRevision(schemaRev)
+        master = self.GetDatabase('MASTR')
+        
+        db = self.CreateDatabase(logicalName)
+        try:
+            vendor = getattr(DatabaseVendor, kwds['databaseVendorName'])
+        except KeyError:
+            vendor = master.Vendor
+        finally:
+            db.Vendor = vendor
+        
+        db.Name = logicalName
+        db.Description = kwds.get('description', '')
+        db.DatabaseName = dbName
+        db.Server = kwds.get('databaseServer', master.Server)
+        
+        login = kwds.get('databaseLogin', master.DBOLogin)
+        password = kwds.get('databasePassword', master.DBOPassword)
+        db.ROLogin = login
+        db.RWLogin = login
+        db.DBOLogin = login
+        db.ROPassword = password
+        db.RWPassword = password
+        db.DBOPassword = password
+        
+        db.SetInitialSchemaRev(revision)
+        db.ApplyPropertyChanges()
+        
+        return db
+                        
+    @cache
+    @selectSingle
+    def getTablePrefix(self, name): pass
     
     @xml()
     def createUserFromXml(self, xmlText, **kwds): pass
@@ -1410,11 +1491,12 @@ class Database(CQObject):
     CLSID = IID('{B48005F0-CF24-11D1-B37A-00A0C9851B52}')
     coclass_clsid = IID('{B48005F2-CF24-11D1-B37A-00A0C9851B52}')
 
-    @raiseExceptionOnError(DatabaseApplyPropertyChangesError)
     def ApplyPropertyChanges(self, varForceEmpty=defaultNamedOptArg):
         # Result is a Unicode object - return as-is for this version of Python
-        return self._oleobj_.InvokeTypes(19, LCID, 1, (8, 0), ((12, 16),),varForceEmpty
+        self.__dict__['_applyPropertyChangesLog'] = \
+            self._oleobj_.InvokeTypes(19, LCID, 1, (8, 0), ((12, 16),),varForceEmpty
             )
+        return
 
     def ApplyPropertyChangesWithCopy(self, varForceEmpty=defaultNamedOptArg):
         # Result is a Unicode object - return as-is for this version of Python
@@ -2131,6 +2213,12 @@ class EntityDef(CQObject):
     _prop_map_put_ = {
     }
     
+    def isStateful(self):
+        return self.GetType() == EntityType.Stateful
+    
+    def isStateless(self):
+        return self.GetType() == EntityType.Stateless
+    
     @cache
     def getUniqueKey(self):
         return UniqueKey(self)
@@ -2142,7 +2230,7 @@ class EntityDef(CQObject):
         return self.getUniqueKey().lookupDbIdByDisplayName(displayName)
 
     @cache
-    @db.selectSingle
+    @selectSingle
     def getFieldDbName(self, fieldDefName): pass
     
     @db.execute
@@ -2159,6 +2247,33 @@ class EntityDef(CQObject):
     
     @db.selectAll
     def listIndexes(self): pass
+    
+    @cache
+    def getAllEntityDefsForReferenceFields(self):
+        return dict([
+            (f, self.GetFieldReferenceEntityDef(f))
+                for f in self.getReferenceFieldNames()
+        ])
+    
+    @cache
+    @selectAll
+    def getReferenceFieldNames(self): pass
+    
+    @cache
+    @selectAll
+    def getReferenceListFieldNames(self): pass
+    
+    @cache
+    @selectAll
+    def getBackReferenceFieldNames(self): pass
+    
+    @cache
+    @selectAll
+    def getBackReferenceListFieldNames(self): pass
+    
+    @selectSingle
+    def getCount(self): pass
+
 
 class EntityDefs(CQObject):
     CLSID = IID('{B9F132EB-96A9-11D2-B40F-00A0C9851B52}')
@@ -3826,6 +3941,37 @@ class Schema(CQObject):
         "Name" : ((1, LCID, 4, 0),()),
         "SchemaRevs" : ((2, LCID, 4, 0),()),
     }
+    
+    def getRevision(self, revision):
+        """
+        @param revision: L{string} representing the revision number to retrieve.
+        @return: L{SchemaRev} object for the given revision.
+        """
+        id = int(revision)
+        revs = self.SchemaRevs
+        rev = None
+        found = False
+        try:
+            rev = revs[id-1]
+            if rev.RevID != id:
+                raise IndexError
+            else:
+                found = True
+        except IndexError:
+            i = 0
+            count = revs.Count
+            while i < count:
+                rev = revs[i]
+                if rev.RevID == id:
+                    found = True
+                    break
+                i += 1
+        finally:
+            if not found:
+                raise ValueError, "revision '%s' does not exist in schema '%s'"\
+                                  % (revision, self.Name)
+            else:
+                return rev
 
 class SchemaRev(CQObject):
     CLSID = IID('{E79F83D9-D096-11D1-B37A-00A0C9851B52}')
@@ -4544,6 +4690,16 @@ class Session(CQObject):
 
     def UserLogon(self, login_name=defaultNamedNotOptArg, password=defaultNamedNotOptArg, database_name=defaultNamedNotOptArg, session_type=defaultNamedNotOptArg
             , database_set=defaultNamedNotOptArg):
+        self.__dict__['_loginName'] = login_name
+        self.__dict__['_password'] = password
+        self.__dict__['_databaseName'] = database_name
+        self.__dict__['_databaseSet'] = database_set
+        self.__dict__['_sessionType'] = session_type
+        # Clear any previously cached AdminSession object.
+        try:
+            del self.__dict__['_cache_getAdminSession']['(),{}']
+        except:
+            pass
         return self._oleobj_.InvokeTypes(21, LCID, 1, (24, 0), ((8, 0), (8, 0), (8, 0), (3, 0), (8, 0)),login_name
             , password, database_name, session_type, database_set)
 
@@ -4573,7 +4729,7 @@ class Session(CQObject):
 
     @cache
     def db(self):
-        return db.Connection(self.connectString())
+        return db.Connection(self)
 
     def lookupEntityDisplayNameByDbId(self, entityDefName, dbid):
         return self.GetEntityDef(entityDefName) \
@@ -4665,17 +4821,10 @@ class Session(CQObject):
         while r.MoveNext() == FetchStatus.Success:
             rows.append([ r.GetColumnValue(i) for i in cols ])
         return rows
-    
+
     @cache
-    def getDbVendorName(self):
-        connectString = self.connectString()
-        driver = re.findall('DRIVER=\{([^\}]+)\}.*$', connectString,
-                            re.IGNORECASE)[0].replace(' ', '')
-        for vendor in DatabaseVendor.values():
-            if vendor in driver:
-                return vendor
-        
-        raise DatabaseVendorNotDiscernableFromConnectString, connectString
+    @selectSingle
+    def getReplicaId(self): pass
     
     @cache
     def getAllEntityDefs(self):
@@ -4701,6 +4850,40 @@ class Session(CQObject):
     def enableAllEntityIndexes(self):
         dummy = [ e.enableAllIndexes() for e in self.getAllEntityDefs() ]
         
+    @cache
+    def getAdminSession(self):
+        adminSession = AdminSession()
+        adminSession.Logon(self._loginName, self._password, self._databaseSet)
+        return adminSession
+    
+    @cache
+    def getTablePrefix(self):
+        adminSession = self.getAdminSession()
+        return adminSession.getTablePrefix(self._databaseName)
+
+    @cache
+    def getPhysicalDatabaseName(self):
+        return connectStringToMap(self.connectString())['DB']
+    
+    @cache
+    def getDatabaseVendorName(self):
+        connectString = self.connectString()
+        driver = re.findall('DRIVER=\{([^\}]+)\}.*$', connectString,
+                            re.IGNORECASE)[0].replace(' ', '')
+        for vendor in DatabaseVendor.values():
+            if vendor in driver:
+                return vendor
+        
+        raise DatabaseVendorNotDiscernableFromConnectString, connectString
+    
+    @cache
+    def getDatabaseVendor(self):
+        return getattr(DatabaseVendor, self.getDatabaseVendorName())
+    
+    @cache
+    @selectSingle
+    def getCollation(self):
+        return { 'databaseName' : self.getPhysicalDatabaseName() }
     
 class User(CQObject):
     CLSID = IID('{B48005E4-CF24-11D1-B37A-00A0C9851B52}')

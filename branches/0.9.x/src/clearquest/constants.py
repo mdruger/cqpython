@@ -6,7 +6,7 @@ class CQConstant(Dict):
         items = self.__class__.__dict__.items()
         for (key, value) in filter(lambda t: t[0][:2] != '__', items):
             self[value] = key
-
+    
 class _ActionType(CQConstant):
     Submit      = 1
     Modify      = 2
@@ -53,6 +53,10 @@ class _DatabaseVendor(CQConstant):
     Oracle      = 4
     DB2         = 5
 DatabaseVendor = _DatabaseVendor()
+UppercaseDatabases = (
+    DatabaseVendor.Oracle,
+    DatabaseVendor.DB2
+)
 
 class _DbAggregate(CQConstant):
     Count   = 1
@@ -170,7 +174,10 @@ FieldType.uniqueKeyTypes = (
     FieldType.Reference,
     FieldType.DbId,
 )
-
+FieldType.textTypes = (
+    FieldType.ShortString,
+    FieldType.MultilineString,
+)
 class _QueryType(CQConstant):
     List    = 1
     Report  = 2
