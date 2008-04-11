@@ -1,8 +1,8 @@
 UPDATE
     ${dstPrefix}.attachments_blob
 SET
-    attachments_dbid = attachments_dbid + 200000,
-    entity_dbid = entity_dbid + 200000,
+    attachments_dbid = attachments_dbid + ${attachmentsDbIdOffset},
+    entity_dbid = entity_dbid + ${dbidOffset},
     ratl_mastership = NULL
 WHERE
     ratl_mastership = ${sourceReplicaId} AND
@@ -12,7 +12,7 @@ WHERE
         FROM
             ${dstPrefix}.attachments a
         WHERE
-            a.dbid = attachments_dbid + 200000)
+            a.dbid = attachments_dbid + ${attachmentsDbIdOffset})
 GO
 DELETE
     ${dstPrefix}.attachments_blob

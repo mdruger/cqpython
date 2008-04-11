@@ -8,10 +8,12 @@ clearquest.merge: module for merging ClearQuest databases
 
 import sys
 import itertools
+from itertools import repeat
+import cStringIO as StringIO
 
 from pywintypes import com_error
 
-from clearquest import db
+from clearquest import api, db
 from clearquest.task import Task, TaskManager
 from clearquest.util import connectStringToMap
 from clearquest.constants import EntityType, FieldType, SessionClassType
@@ -132,29 +134,67 @@ def insertEntity(destSession, sourceSession, entityDefName):
     }
     return kwds
 
-def bulkCopy(destSession, sourceSessions, dbidOffsets):
-              
-    dbidOffsets = list(dbidOffsets)
+def getRecommendedStatefulDbIdOffset(session):
+    maximum = (0, '<entity def name>')
+    dbc = session.db()
+    for entityDef in session.getStatefulEntityDefs():
+        name = entityDef.GetDbName()
+        m = dbc.selectSingle('SELECT MAX(dbid) FROM %s' % name)
+        if m > maximum[0]:
+            maximum = (m, name)
+    
+    # 0x2000000 = 33554432: starting dbid used by CQ databases.  The
+    # offset gets added to each dbid, which, technically, could be as
+    # low as the very minimum, so check that the dbidOffset provided is
+    # sufficient.
+    m = str(maximum[0] - 33554432)
+    recommended = str(int(m[0])+1) + '0' * (len(m)-1)
+    return int(recommended)
+
+def getMaxIdForField(session, table, column):
+    db = session.db().selectSingle('SELECT MAX(%s) FROM %s' % (column, table))
+
+def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
+
     preCopySql  = []
     bulkCopySql = []
     postCopySql = []
     enableIndexesSql = []
     disableIndexesSql = []
     
-    straightCopyTargets = (
-        'history',
-        'attachments',
-        'attachments_blob',
-        'parent_child_links',
-    )
-    targets = list(straightCopyTargets) + [
-        e.GetName() for e in destSession.getAllEntityDefs()
-            if e.GetName() not in straightCopyTargets
-    ]
     dstReplicaId = destSession.getReplicaId()
     dstPrefix = destSession.getTablePrefix()
     dstDb = destSession.db()
     
+    straightCopyTargets = (
+        u'history',
+        u'attachments',
+        u'attachments_blob',
+        u'parent_child_links',
+    )
+    getTargets = lambda method: list(straightCopyTargets) + [
+        method(e) for e in destSession.getAllEntityDefs()
+            if method(e) not in straightCopyTargets
+    ]
+    targets = getTargets(api.EntityDef.GetName)
+    
+    dbidOffsets = dict()
+    for table in getTargets(api.EntityDef.GetDbName):
+        if table in ('attachments_blob', 'ratl_replicas'):
+            continue
+        offset = dstDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
+        if not offset:
+            continue
+        if offset > 0:
+            offset -= 33554432
+        dbidOffsets[table] = offset
+    
+    statefulDbIdOffset = getRecommendedStatefulDbIdOffset(destSession)
+    dbidOffsets.update(
+        zip([e.GetDbName() for e in destSession.getStatefulEntityDefs()], 
+            repeat(statefulDbIdOffset))
+    )
+        
     (userEntityDefId, groupsFieldDefId) =                       \
         dstDb.selectAll(                                        \
             "SELECT e.id, f.id FROM fielddef f, entitydef e "   \
@@ -206,9 +246,6 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
                             })
                         )
                     
-        if not emptyDb:
-            dbidOffset = dbidOffsets.pop(0)
-            
         sourceReplicaId = str(sourceSession.getReplicaId())
         
         for target in targets:
@@ -226,6 +263,8 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
             dstTable = '.'.join((dstPrefix, tableName))
             srcPrefix = sourceSession.getTablePrefix()
             srcTable = '.'.join((srcPrefix, tableName))
+            
+            dbidOffset = dbidOffsets.get(tableName) or 0
             
             if firstSession:
                 disableIndexesSql += [
@@ -270,11 +309,11 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
                 
                 orderBy = ''
                 if not emptyDb:
-                    dbidColumn = '(src.dbid + %s)' % dbidOffset
+                    dbidColumn = '(src.dbid + %d)' % dbidOffset
                 else:
                     dbidColumn = 'src.dbid'
                 if not straightCopy and \
-                       entityDef.GetType()==EntityType.Stateless:
+                       entityDef.GetType() == EntityType.Stateless:
                     where += ' AND NOT EXISTS (%s)' % \
                              entityDef                \
                                 .getUniqueKey()       \
@@ -305,6 +344,7 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
             
             if straightCopy or entityDefName in ('users', 'groups'):
                 continue
+            
             
             # If we get here, we've generated the SQL necessary for bringing the
             # entity/table over via a direct insert.  Our next step requires us
@@ -395,26 +435,29 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
             if emptyDb:
                 continue
             
-            # The 'bulkCopy.updateHistory' SQL actually issues two statements;
-            # one UPDATE that takes care of updating the entity_dbid for the
-            # imported entity, then a DELETE to get rid of any history rows that
-            # were brought over for entities that aren't present in the final db
-            # (which would be the case for stateless entities that already had
-            # an existing entity in the database matching their unique display
-            # name).
+            attachmentsDbIdOffset = dbidOffsets['attachments']
             kwds = {
                 'dstTable'  	: dstTable,
                 'dstPrefix' 	: dstPrefix,
                 'dbidOffset'    : dbidOffset,
                 'entityDefName' : entityDefName,
                 'sourceReplicaId': sourceReplicaId,
+                'attachmentsDbIdOffset' : attachmentsDbIdOffset
             }
             postCopySql.append(findSql('bulkCopy.updateHistory', **kwds))
             
-            # And finally, update attachments & attachments_blob.
-            #kwds['session'] = destSession
+            # Update attachments & attachments_blob.
             postCopySql.append(findSql('bulkCopy.updateAttachments', **kwds))
             
+            # And finally, update ratl_mastership, indicating that this entity
+            # has now been merged completely into the destination database.
+            postCopySql.append(                                                \
+                "UPDATE %s SET ratl_mastership = %d WHERE dbid <> 0 "          \
+                "AND ratl_mastership <> %d" %                                  \
+                    (dstTable,
+                     dstReplicaId,
+                     dstReplicaId)
+            )
             
         if not emptyDb:
             postCopySql.append("DELETE %s.history WHERE ratl_mastership = %s" %\
@@ -429,23 +472,25 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
                     'dstPrefix' : dstPrefix,
                     'dbidOffset': dbidOffset,
                     'sourceReplicaId': sourceReplicaId,
+                    'attachmentsDbIdOffset' : attachmentsDbIdOffset
                 })
             )
             allEntityDefs = destSession.getAllEntityDefs()
-            for e in allEntityDefs:
-                postCopySql.append(                                            \
-                    "UPDATE %s.%s SET ratl_mastership = %d WHERE dbid <> 0 "   \
-                    "AND ratl_mastership <> %d" %                              \
-                        (dstPrefix,
-                         e.GetDbName(),                 
-                         dstReplicaId,
-                         dstReplicaId)
-                )
+
     
-    postCopySql.append(                                                        \
-        "UPDATE %s.dbglobal SET next_request_id = next_request_id + %s, "      \
-        "next_aux_id = next_aux_id + %s" %                                     \
-            (dstPrefix, dbidOffsets[-1], dbidOffsets[-1])
+    getMaxDbIdSql = lambda method:                                             \
+        'SELECT TOP 1 ((dbid+1)-0x2000000) FROM (%s) AS x ORDER BY dbid DESC' %\
+            ' UNION '.join([                                                   \
+                'SELECT MAX(dbid) AS dbid FROM %s' % entityDef.GetDbName()     \
+                    for entityDef in method(destSession)                       \
+            ])
+        
+    postCopySql.append(
+        'UPDATE %s.dbglobal SET next_request_id = (%s), next_aux_id = (%s)' % (
+            dstPrefix,
+            getMaxDbIdSql(api.Session.getStatefulEntityDefs),
+            getMaxDbIdSql(api.Session.getStatelessEntityDefs)
+        )
     )
     
     postCopySql.append(\
@@ -454,11 +499,19 @@ def bulkCopy(destSession, sourceSessions, dbidOffsets):
         })
     )
     
-    return (disableIndexesSql,
+    output.write('\nGO\n'.join([
+        '\nGO\n'.join([
+            line for line in section
+        ]) for section in (
+            disableIndexesSql,
             preCopySql,
             bulkCopySql,
             postCopySql,
-            enableIndexesSql)
+            enableIndexesSql
+        )
+    ]))
+    
+    return output
 
 def bulkCopyBackup(destSession, sourceSessions, dbidOffsets):
     targets = [ e.GetName() for e in destSession.getAllEntityDefs() ] + \
