@@ -57,9 +57,11 @@ def connectStringToMap(connectString):
         m['DB'] = m['DATABASE']
     elif 'DB' in m:
         m['DATABASE'] = m['DB']
+    elif 'SID' in m:
+        m['DATABASE'] = m['SID']
     else:
-        raise ValueError, "could not find value for 'DB' or 'DATABASE' in " \
-                          "connection string"
+        raise ValueError, "could not find value for 'DATABASE', 'DB' or 'SID' "\
+                          " in connection string"
     return m
 
 def spliceWork(dataOrSize, nchunks):
