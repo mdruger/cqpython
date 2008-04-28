@@ -17,5 +17,7 @@ SELECT
     ${srcColumns}
 FROM
     ${srcTable} src
+WITH
+    (NOLOCK)
 ${where}
 ${orderBy}
