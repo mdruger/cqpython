@@ -209,7 +209,6 @@ def raiseExceptionOnError(exceptionType):
     
 from win32com.client import DispatchBaseClass
 class CQObject(DispatchBaseClass):
-    
     """
     When a child object is created via a @returns(typename) decorator, it will
     inherit any of the properties defined in the sharedProperties tuple below,
@@ -1078,7 +1077,7 @@ class AdminSession(CQObject):
 
     def Logon(self, Name=defaultNamedNotOptArg, password=defaultNamedNotOptArg, masterDbName=defaultNamedNotOptArg):
         self.__dict__['_loginName'] = Name
-        self.__dict__['_password'] = password,
+        self.__dict__['_password'] = password
         self.__dict__['_databaseSet'] = masterDbName
         return self._oleobj_.InvokeTypes(12, LCID, 1, (24, 0), ((8, 0), (8, 0), (8, 0)),Name
             , password, masterDbName)
@@ -1287,6 +1286,16 @@ class AdminSession(CQObject):
     
     @xml()
     def createDatabasesFromXml(self, xmlText): pass
+    
+    def setVisible(self, visible, databaseName):
+        v = int(bool(visible))
+        if v not in (0, 1):
+            raise ValueError("visible must be boolean")
+        self.db().execute(
+            "UPDATE master_dbs SET is_visible = %d WHERE name = '%s'" % (
+                v, databaseName
+            )
+        )
         
 
 class ChartMgr(CQObject):
@@ -4884,6 +4893,20 @@ class Session(CQObject):
     @selectSingle
     def getCollation(self):
         return { 'databaseName' : self.getPhysicalDatabaseName() }
+    
+    
+    @cache
+    def schemaName(self):
+        return self.db().selectSingle('SELECT schema_name FROM dbglobal')
+    
+    @cache
+    def schemaRevision(self):
+        return self.db().selectSingle('SELECT schema_rev FROM dbglobal')
+    
+    @cache
+    def schemaRevisionVersion(self):
+        return self.db().selectSingle('SELECT schemarev_version FROM dbglobal')
+    
     
 class User(CQObject):
     CLSID = IID('{B48005E4-CF24-11D1-B37A-00A0C9851B52}')
