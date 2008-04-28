@@ -15,7 +15,7 @@ from pywintypes import com_error
 
 from clearquest import api, db
 from clearquest.task import Task, TaskManager
-from clearquest.util import connectStringToMap
+from clearquest.util import connectStringToMap, listToMap
 from clearquest.constants import EntityType, FieldType, SessionClassType
 
 #===============================================================================
@@ -24,6 +24,15 @@ from clearquest.constants import EntityType, FieldType, SessionClassType
 __rcsid__ = '$Id$'
 __rcsurl__ = '$URL$'
 __copyright__ = 'Copyright 2008 OnResolve Ltd'
+
+__orig_db   = 'merge_orig_db'
+__orig_id   = 'merge_orig_id'
+__orig_dbid = 'merge_orig_dbid'
+
+MergeFields = {
+    __orig_db    : FieldType.Integer,
+    __orig_dbid  : FieldType.Integer,
+}
 
 #===============================================================================
 # Decorators
@@ -134,6 +143,64 @@ def insertEntity(destSession, sourceSession, entityDefName):
     }
     return kwds
 
+def addMergeFields(adminSession, destSession):
+    """
+    @param adminSession: instance of api.AdminSession() that's logged in to the
+    schema database that the merge fields should be added to.
+    @param destSession: instance of api.Session() for any database using the
+    schema that is to be modified to add the merge fields.
+    """
+    adminSession.setVisible(False, destSession._databaseName)
+    
+    import clearquest.designer
+    designer = clearquest.designer.Designer()
+    designer.Login(adminSession._databaseName,
+                   adminSession._loginName,
+                   adminSession._password,
+                   adminSession._databaseSet)
+    
+    schemaName = destSession.schemaName()
+    designer.CheckoutSchema(schemaName, '')
+    
+    for entityDef in destSession.getAllEntityDefs():
+        entityDefName = entityDef.GetName()
+        fields = listToMap(entityDef.GetFieldDefNames()).keys()
+        for (mergeField, mergeFieldType) in MergeFields.items():
+            if mergeField not in fields:
+                print "adding field '%s' of type '%s' to entity '%s'..." % (   \
+                    mergeField,
+                    FieldType[mergeFieldType],
+                    entityDefName
+                )
+                designer.UpgradeFieldDef(entityDefName,
+                                         mergeField,
+                                         mergeFieldType,
+                                         None)
+            else:
+                if entityDef.GetFieldDefType(mergeField) != mergeFieldType:
+                    raise RuntimeError("entity '%s' already has a field named "
+                                       "'%', but it is not a short string." %  \
+                                       (entityDefName, mergeField))
+                
+            oldMergeField = '__%s' % mergeField
+            if oldMergeField in fields:
+                print "deleting old field '%s' from entity '%s'..." % (   \
+                    oldMergeField,
+                    entityDefName
+                )
+                designer.DeleteFieldDef(entityDefName, oldMergeField)
+                
+    print "validating schema..."
+    designer.ValidateSchema()
+    print "checking in schema..."
+    designer.CheckinSchema('Added fields for database merge.')
+    print "upgrading database '%s'..." % destSession._databaseName
+    designer.UpgradeDatabase(destSession._databaseName)
+    designer.Logoff()
+    del designer
+    
+    adminSession.setVisible(True, destSession._databaseName)
+
 def getRecommendedStatefulDbIdOffset(session):
     maximum = (0, '<entity def name>')
     dbc = session.db()
@@ -147,6 +214,8 @@ def getRecommendedStatefulDbIdOffset(session):
     # offset gets added to each dbid, which, technically, could be as
     # low as the very minimum, so check that the dbidOffset provided is
     # sufficient.
+    if maximum[0] == 0:
+        return 0
     m = str(maximum[0] - 33554432)
     recommended = str(int(m[0])+1) + '0' * (len(m)-1)
     return int(recommended)
@@ -154,7 +223,37 @@ def getRecommendedStatefulDbIdOffset(session):
 def getMaxIdForField(session, table, column):
     db = session.db().selectSingle('SELECT MAX(%s) FROM %s' % (column, table))
 
-def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
+def getDbIdOffsets(destSession, session):
+    dbidOffsets = dict()
+    for table in getTargets(api.EntityDef.GetDbName):
+        if table in ('attachments_blob', 'ratl_replicas'):
+            continue
+        offset = dstDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
+        if not offset:
+            offset = 0
+        if offset > 0:
+            offset -= 33554432
+        dbidOffsets[table] = offset
+    
+    statefulDbIdOffset = getRecommendedStatefulDbIdOffset(destSession)
+    dbidOffsets.update(
+        zip([e.GetDbName() for e in destSession.getStatefulEntityDefs()], 
+            repeat(statefulDbIdOffset))
+    )
+
+def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO(),
+             mergeFields=MergeFields):
+    
+    if mergeFields:
+        # Every entityDef in destSession should have all merge fields.
+        for entityDef in destSession.getAllEntityDefs():
+            fields = listToMap(entityDef.GetFieldDefNames())
+            for expected in mergeFields.keys():
+                if expected not in fields:
+                    raise RuntimeError("entity '%s' is missing field '%s', "   \
+                                       "run addMergeFields() first" %          \
+                                       (entityDef.GetName(), expected))
+    
 
     preCopySql  = []
     bulkCopySql = []
@@ -184,7 +283,7 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
             continue
         offset = dstDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
         if not offset:
-            continue
+            offset = 0
         if offset > 0:
             offset -= 33554432
         dbidOffsets[table] = offset
@@ -194,7 +293,8 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
         zip([e.GetDbName() for e in destSession.getStatefulEntityDefs()], 
             repeat(statefulDbIdOffset))
     )
-        
+    
+
     (userEntityDefId, groupsFieldDefId) =                       \
         dstDb.selectAll(                                        \
             "SELECT e.id, f.id FROM fielddef f, entitydef e "   \
@@ -206,13 +306,38 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
         'destSession'  : destSession
     }))
     
+    emptyDb = False
+    firstSession = True
     sessionCounter = itertools.count(1)
     for sourceSession in sourceSessions:
         sessionCount = sessionCounter.next()
-        emptyDb = False
-        firstSession = False
-        if sessionCount == 1:
+        if sessionCount > 1:
+            emptyDb = False
+            firstSession = False
+            previousSession = sourceSessions[sessionCount-2]
+            dbidOffsets = dict()
+            prevDb = previousSession.db()
+            for table in getTargets(api.EntityDef.GetDbName):
+                if table in ('attachments_blob', 'ratl_replicas'):
+                    continue
+                offset = prevDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
+                if not offset:
+                    offset = 0
+                if offset > 0:
+                    offset -= 33554432+1
+                dbidOffsets[table] = offset
+            
+            statefulDbIdOffset = getRecommendedStatefulDbIdOffset(\
+                previousSession)
+            
+            dbidOffsets.update(zip([
+                    e.GetDbName() for e in destSession.getStatefulEntityDefs()
+                ], repeat(statefulDbIdOffset))
+            )
+        else:
             firstSession = True
+            previousSession = None
+            dbidOffsets = dict()
             # Crude check to see if 'destSession' is pointing to an empty (i.e.
             # newly created) ClearQuest database by seeing whether or not the
             # default entity has any records.
@@ -254,10 +379,14 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
                 tableName = target
                 entityDef = None
                 entityDefName = None
+                entityType = None
+                isStatefulEntity= False
             else:
                 straightCopy = False
                 entityDef = destSession.GetEntityDef(target)
                 entityDefName = entityDef.GetName()
+                entityType= entityDef.GetType()
+                isStatefulEntity = entityDef.GetType() == EntityType.Stateful
                 tableName = entityDef.GetDbName()
             
             dstTable = '.'.join((dstPrefix, tableName))
@@ -267,22 +396,26 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
             dbidOffset = dbidOffsets.get(tableName) or 0
             
             if firstSession:
-                disableIndexesSql += [
+                disableIndexesSql.append('\nGO\n'.join([
                     'ALTER INDEX %s ON %s DISABLE' % (index, dstTable)
                         for index in dstDb.getIndexes(tableName)
-                ]
-                enableIndexesSql += [
+                ]))
+                
+                enableIndexesSql.append('\nGO\n'.join([
                     'ALTER INDEX %s ON %s REBUILD' % (index, dstTable)
                         for index in dstDb.getIndexes(tableName)
-                ]
+                ]))
                 
-            exclude = (
+            exclude = [
                 'dbid',
                 'ratl_keysite',
                 'ratl_mastership',
                 'lock_version', 
                 'locked_by',
-            )
+            ]
+            if mergeFields:
+                exclude += [ key for key in mergeFields.keys() ]
+                
             columns = [
                 (c[3], 'src.%s' % c[3])
                     for c in dstDb.cursor().columns(table=tableName).fetchall()
@@ -305,13 +438,12 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
                     
             else:
                 where = 'WHERE src.dbid <> 0'
-                #orderBy = 'ORDER BY src.dbid ASC'
+                orderBy = 'ORDER BY src.dbid ASC'
                 
-                orderBy = ''
-                if not emptyDb:
-                    dbidColumn = '(src.dbid + %d)' % dbidOffset
-                else:
+                if emptyDb:
                     dbidColumn = 'src.dbid'
+                else:
+                    dbidColumn = '(src.dbid + %d)' % dbidOffset
                 if not straightCopy and \
                        entityDef.GetType() == EntityType.Stateless:
                     where += ' AND NOT EXISTS (%s)' % \
@@ -325,7 +457,13 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
                 addReplicaColumn = True
             else:
                 addReplicaColumn = False
-                columns += [ ('dbid', dbidColumn) ]
+                columns += [ ('dbid', dbidColumn), ]
+                if mergeFields:
+                    columns += [
+                        (__orig_db, "'%s'" % sourceSession._databaseName),
+                        (__orig_dbid, 'src.dbid'),
+                        (__orig_id, ('src.id' if isStatefulEntity else 'NULL')),
+                    ]
             
             dstColumns = [ c[0] for c in columns ]
             srcColumns = [ c[1] for c in columns ]
@@ -512,216 +650,6 @@ def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO()):
     ]))
     
     return output
-
-def bulkCopyBackup(destSession, sourceSessions, dbidOffsets):
-    targets = [ e.GetName() for e in destSession.getAllEntityDefs() ] + \
-              [ 'attachments_blob', 'parent_child_links' ]
-    
-    disableIndexesSql = []
-    bulkCopySql = []
-    postCopySql = []
-    
-    straightCopyTargets = (
-        'history',
-        'attachments',
-        'ratl_replicas',
-        'attachments_blob',
-        'parent_child_links',
-    )
-    dstPrefix = destSession.getTablePrefix()
-    dstDb = destSession.db()
-    
-    (userEntityDefId, groupsFieldDefId) = \
-        dstDb.selectSingle(\
-            "SELECT e.id, f.id FROM fielddef f, entitydef e " \
-            "WHERE e.name = 'users' AND f.name = 'groups' AND " \
-            "f.entitydef_id = e.id")[0]
-    
-    
-    sessionCounter = itertools.count(1)
-    for sourceSession in sourceSessions:
-        sessionCount = sessionCounter.next()
-        emptyDb = True if sessionCount == 1 else False
-        if not emptyDb:
-            dbidOffset = dbidOffsets[sessionCount-2]
-            
-        sourceReplicaId = str(sourceSession.getReplicaId())
-        
-        for target in targets:
-            if target in straightCopyTargets:
-                straightCopy = True
-                tableName = target
-                entityDef = None
-                entityDefName = None
-            else:
-                straightCopy = False
-                entityDef = destSession.GetEntityDef(target)
-                entityDefName = entityDef.GetName()
-                tableName = entityDef.GetDbName()
-            
-            dstTable = '.'.join((dstPrefix, tableName))
-            srcPrefix = sourceSession.getTablePrefix()
-            srcTable = '.'.join((srcPrefix, tableName))
-            
-            if emptyDb:
-                disableIndexesSql += [
-                    'ALTER INDEX %s ON %s DISABLE' % (index, dstTable)
-                        for index in dstDb.getIndexes(tableName)
-                ]
-            
-            exclude = (
-                'dbid',
-                'version', 
-                'ratl_keysite',
-                'lock_version', 
-                'locked_by'
-            )
-            columns = [
-                (c[3], 'src.%s' % c[3])
-                    for c in dstDb.cursor().columns(table=tableName).fetchall()
-                        if c[3] not in exclude
-            ]
-            
-            
-            if target in ('attachments_blob', 'parent_child_links'):
-                orderBy = ''
-                dbidColumn = ''
-                where = ''
-                if target == 'parent_child_links':
-                    where = "WHERE NOT (src.parent_entitydef_id = %d AND "     \
-                            "src.child_entitydef_id = %d AND "                 \
-                            "src.parent_fielddef_id = %d AND "                 \
-                            "src.child_fielddef_id = 0 AND "                   \
-                            "src.link_type_enum = 1)" %                        \
-                                (userEntityDefId,                              \
-                                 userEntityDefId,                              \
-                                 groupsFieldDefId)
-                    
-            else:
-                where = 'WHERE src.dbid <> 0'
-                #orderBy = 'ORDER BY src.dbid ASC'
-                
-                orderBy = ''
-                if not emptyDb:
-                    dbidColumn = '(src.dbid + %s)' % dbidOffset
-                else:
-                    dbidColumn = 'src.dbid'
-                if not straightCopy and \
-                       entityDef.GetType()==EntityType.Stateless:
-                    where += ' AND NOT EXISTS (%s)' % \
-                             entityDef                \
-                                .getUniqueKey()       \
-                                ._lookupDbIdFromForeignSessionSql('src.dbid',
-                                                                  sourceSession)
-                
-            if target in ('attachments_blob', 'parent_child_links'):
-                addReplicaColumn = True
-                columns += [ ('ratl_mastership', sourceReplicaId) ]
-            else:
-                addReplicaColumn = False
-                columns += [ ('dbid', dbidColumn) ]
-            
-            dstColumns = [ c[0] for c in columns ]
-            srcColumns = [ c[1] for c in columns ] 
-            
-            kwds = {
-                'where'    : where,
-                'orderBy'  : orderBy,
-                'srcTable' : srcTable,
-                'dstTable' : dstTable,
-                'session'  : destSession,
-                'tableName': tableName,
-                'srcColumns' : ',\n    '.join(srcColumns),
-                'dstColumns' : ',\n    '.join(dstColumns),
-                'addReplicaColumn' : addReplicaColumn,
-            }
-            bulkCopySql.append(findSql('bulkCopy', **kwds))
-            
-            if straightCopy or entityDefName in ('users', 'groups'):
-                continue
-
-            isValidReference = lambda f:                                       \
-                entityDef.GetFieldDefType(f) in FieldType.referenceTypes and   \
-                f not in ('ratl_keysite', 'ratl_mastership') and               \
-                (False if emptyDb and entityDef.GetFieldReferenceEntityDef(f)  \
-                                               .GetName() not in               \
-                                               ('users', 'groups') else True)
-                        
-            referenceFields = dstDb.selectAll(                      \
-                "SELECT f.name, f.db_name,  FROM fielddef f, entitydef e "       \
-                "WHERE e.name = '%s' AND f.entitydef_id = e.id "    \
-                "AND f.ref_role = 1 AND f.name IN (%s)" %           \
-                   (entityDefName, ", ".join([
-                        "'%s'" % f for f in entityDef.GetFieldDefNames()
-                            if isValidReference(f, FieldType.ReferenceList)
-                    ]))
-            )
-            lookupNewDbId = lambda f, r:                                       \
-                r.isStateful() and '%s + %s' % (r.getFieldDbName(f),dbidOffset)\
-                or r.getUniqueKey()._lookupDbIdFromForeignSessionSql(          \
-                    r.getFieldDbName(f), sourceSession)
-                
-            referenceFields = dict([
-                (f, lookupNewDbId(f, r)) for (f, r) in
-                    entityDef.getAllEntityDefsForReferenceFields().items()
-                        if f not in ('ratl_keysite', 'ratl_mastership') and not
-                        (emptyDb and r.GetName() not in ('users', 'groups'))
-            ])
-            
-            updates = dict()
-            for f in referenceFields:
-                column = entityDef.getFieldDbName(f)
-                ref = entityDef.GetFieldReferenceEntityDef(f)
-                
-                if ref.GetType() == EntityType.Stateful:
-                    newDbId = '%s + %s' % (column, dbidOffset)
-                else:
-                    newDbId = \
-                        ref.getUniqueKey()._lookupDbIdFromForeignSessionSql(
-                            column, sourceSession)
-                        
-                updates[column] = '(CASE WHEN %s = 0 THEN 0 ELSE (%s) END)' %  \
-                                   (column, newDbId)
-                             
-            if updates:
-                postCopySql.append(                                 \
-                    "UPDATE %s SET %s WHERE ratl_mastership = %s" % \
-                    (dstTable,
-                     ', '.join(['%s = %s' % i for i in updates.items() ]),
-                     sourceReplicaId)
-                )
-                
-#                updates = [ '%s = %s' % i for i in updates.items() ]                             
-#                
-#                postCopySql.append(findSql('bulkCopy.updateReferences', **{
-#                    'updates'   : ',\n    '.join(updates),
-#                    'replicaId' : sourceReplicaId,
-#                    'session'   : destSession,
-#                    'dstTable'  : dstTable,
-#                }))
-            
-            referenceListFields1 = dstDb.selectAll(                  \
-                "SELECT f.name FROM fielddef f, entitydef e "       \
-                "WHERE e.name = '%s' AND f.entitydef_id = e.id "    \
-                "AND f.ref_role = 1 AND f.name IN (%s)" %           \
-                   (entityDefName, ", ".join([
-                        "'%s'" % f for f in entityDef.GetFieldDefNames()
-                            if isValidReference(f, FieldType.ReferenceList)
-                    ]))
-            )
-                        
-            referenceListFields2 = lambda entityDef: dstDb.selectAll(                  \
-                "SELECT f.name FROM fielddef f, entitydef e "       \
-                "WHERE e.name = '%s' AND f.entitydef_id = e.id "    \
-                "AND f.ref_role = 1 AND f.name IN (%s)" %           \
-                   (entityDefName, ", ".join([
-                        "'%s'" % f for f in entityDef.GetFieldDefNames()
-                            if isValidReference(f, FieldType.ReferenceList)
-                    ]))
-            )
-                
-    return (disableIndexesSql, bulkCopySql, postCopySql)
-
 
 #===============================================================================
 # Classes
