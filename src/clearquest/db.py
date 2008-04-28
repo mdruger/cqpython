@@ -241,7 +241,7 @@ class Connection(object):
                                       table=tableName.upper()).fetchall()
         ]
     
-    def getIndexes(self, table): 
+    def getIndexes(self, table):
         return listToMap([
             i[5] for i in self.cursor()
                               .statistics(table,
