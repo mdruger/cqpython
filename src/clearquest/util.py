@@ -8,10 +8,18 @@ clearquest.util: module for any miscellaneous utilities (methods, classes etc)
 
 import os, sys
 import pythoncom
+import cStringIO as StringIO
+
 from inspect import ismethod
 from functools import wraps
 from itertools import repeat
+from subprocess import Popen, PIPE
+
 from win32com.client import DispatchBaseClass
+from win32api import RegCloseKey, RegOpenKeyEx, RegQueryValueEx
+from win32con import HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE
+
+from clearquest.constants import CQConstant
 
 #===============================================================================
 # Globals
@@ -22,7 +30,21 @@ __rcsurl__ = '$URL$'
 __copyright__ = 'Copyright 2008 OnResolve Ltd'
 
 #===============================================================================
-# Helper Methods
+# Constants
+#===============================================================================
+
+class _BucketStorageType(CQConstant):
+    File      = '-st'
+    Directory = '-di'
+BucketStorageType = _BucketStorageType()
+
+class _BucketToolOperation(CQConstant):
+    Export    = '-e'
+    Import    = '-i'
+    Update    = '-u'
+BucketToolOperation = _BucketToolOperation()
+#===============================================================================
+# Public Helper Methods
 #===============================================================================
 
 def listToMap(l):
@@ -39,6 +61,9 @@ def toList(l):
 
 def iterable(i):
     return (i,) if not hasattr(i, '__iter__') else i
+
+def unzip(args):
+    return tuple(map(list, zip(*args)))
 
 def concat(arg1, *other):
     if not other:
@@ -61,6 +86,7 @@ def connectStringToMap(connectString):
         m['DATABASE'] = m['DB']
     elif 'SID' in m:
         m['DATABASE'] = m['SID']
+        m['DB'] = m['SID']
     else:
         raise ValueError, "could not find value for 'DATABASE', 'DB' or 'SID' "\
                           " in connection string"
@@ -78,6 +104,88 @@ def spliceWork(dataOrSize, nchunks):
         results.append((i*size, (i+1)*size))
     results.append(((nchunks-1)*size, max-1))
     return results
+
+def readRegKey(path, hive=HKEY_LOCAL_MACHINE):
+    path = _cleanPath(path)
+    prefix = path[0:path.rfind('\\')]
+    setting = path[len(prefix)+1:]
+    try:
+        key = RegOpenKeyEx(HKEY_LOCAL_MACHINE, prefix, 0, KEY_QUERY_VALUE)
+    except:
+        raise
+    else:
+        try:
+            value, unused = RegQueryValueEx(key, setting)
+        finally:
+            RegCloseKey(key)    
+    return value
+    
+def getRationalInstallDir():
+    rationalDir = readRegKey('Software/Rational Software/RSINSTALLDIR')
+    if not rationalDir:
+        raise RuntimeError('No value for HKLM\\%s\\%s' % \
+                           (path, 'RSINSTALLDIR'))
+    if not os.path.isdir(rationalDir):
+        raise RuntimeError('No such directory: %s' % rationalDir)
+    return rationalDir
+
+def getClearQuestInstallationDir():
+    return joinPath(getRationalInstallDir(), 'ClearQuest')
+
+
+def exportQueries(session, storagePath, storageType=BucketStorageType.File):
+    return _bucketTool(session,
+                       storagePath,
+                       storageType,
+                       BucketToolOperation.Export)
+
+def importQueries(session, storagePath, storageType=BucketStorageType.File):
+    return _bucketTool(session,
+                       storagePath,
+                       storageType,
+                       BucketToolOperation.Import)
+
+def updateQueries(session, storagePath, storageType=BucketStorageType.File):
+    return _bucketTool(session,
+                       storagePath,
+                       storageType,
+                       BucketToolOperation.Update)
+
+#===============================================================================
+# Private Methods
+#===============================================================================
+def _cleanPath(path):
+    if '/' in path:
+        return path.replace('/', '\\')
+    return path
+
+def _getBucketToolExe():
+    path = joinPath(getClearQuestInstallationDir(), 'bkt_tool.exe')
+    if not os.path.isfile(path):
+        raise RuntimeError("no such file: %s" % path)
+    return path
+
+def _bucketTool(session, storagePath, storageType, operation):
+    """
+    @returns: C{tuple}: (<return code>, <stdout>, <stderr>)
+    """
+    args = (
+        _getBucketToolExe(),
+        operation,
+        '-us',  session._loginName,
+        '-p',   session._password,
+        '-db',  session._databaseName,
+        '-dbs', session._databaseSet,
+        storageType, storagePath,
+    )
+    stdout = StringIO.StringIO()
+    stderr = StringIO.StringIO()
+    p = Popen(args, stdout=PIPE, stderr=PIPE)
+    p.wait()
+    if p.returncode != 0:
+        raise RuntimeError("bkt_tool.exe failed with error code %d: %s" % \
+                           (p.returncode, p.stderr.read()))
+    return
 
 #===============================================================================
 # Decorators
@@ -155,8 +263,8 @@ class Dict(dict):
     def __getattr__(self, name):
         return self.__getitem__(name)
     def __setattr__(self, name, value):
-        return self.__setitem__(name, value)    
-        
+        return self.__setitem__(name, value)
+    
 class CQBaseObject(DispatchBaseClass):
     def __init__(self, *args, **kwds):
         for key, value in kwds.items():
@@ -168,3 +276,4 @@ class CQBaseObject(DispatchBaseClass):
         if not args and self.__class__.__name__ in topLevelObjects:
             args = (pythoncom.new(self.coclass_clsid),)
         DispatchBaseClass.__init__(self, *args)
+        

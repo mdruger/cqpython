@@ -1,6 +1,6 @@
 SELECT
     dbid,
-   (SELECT id FROM entitydef WHERE name = '%s')
+    ${entityDefId}
 FROM
     %s
 WHERE
