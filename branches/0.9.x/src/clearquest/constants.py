@@ -1,11 +1,13 @@
 
-from clearquest.util import Dict
-
-class CQConstant(Dict):
+class CQConstant(dict):
     def __init__(self):
         items = self.__class__.__dict__.items()
         for (key, value) in filter(lambda t: t[0][:2] != '__', items):
             self[value] = key
+    def __getattr__(self, name):
+        return self.__getitem__(name)
+    def __setattr__(self, name, value):
+        return self.__setitem__(name, value)            
     
 class _ActionType(CQConstant):
     Submit      = 1

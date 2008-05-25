@@ -24,10 +24,12 @@ from genshi.template import Context, MarkupTemplate, TemplateLoader, \
 
 from clearquest import db
 from clearquest.db import selectAll, selectSingle, getConnectOptionsFromRegistry
-from clearquest.distributed import distributed, Cluster
 from clearquest.constants import *
-from clearquest.util import cache, concat, Dict, iterable, joinPath, listToMap,\
-                            symbols, symbolMap, toList
+from clearquest.util import cache, concat, connectStringToMap, Dict, iterable, \
+                            joinPath, listToMap, symbols, symbolMap, toList
+
+# Disable the distributed stuff for now.
+#from clearquest.distributed import distributed, Cluster
 
 #===============================================================================
 # makepy Globals
@@ -119,6 +121,25 @@ def addWorkspaceItemNature(object=None, **kwds):
     
     if object is None:
         return k
+    
+@cache
+def getLinkedServerAwareTablePrefix(targetSession, otherSessions):
+    """
+    Returns a table prefix for target session that is suitable for use over
+    linked database instances.
+    """
+    qualify = False
+    us = targetSession.connectStringToMap()['SERVER']
+    for them in [ Session.connectStringToMap(s) for s in otherSessions ]:
+        if them['SERVER'] != us:
+            qualify = True
+            break
+        
+    prefix = targetSession.getTablePrefix()
+    if qualify:
+        return '[%s].%s' % (us, prefix)
+    else:
+        return prefix
 
 #===============================================================================
 # XML Template Loader
@@ -679,10 +700,13 @@ class DeferredWriteSchemaObjectProxy(SchemaObjectProxy):
 
 class UniqueKey(object):
     
-    def __init__(self, entityDef, depth=0):
+    def __init__(self, entityDef, tableAlias='t1'):
         self.session = entityDef.session
         self.entityDef = entityDef
-        self._depth = 0
+        self._tableAlias = tableAlias
+    
+    def _alias(self, column):
+        return '%s.%s' % (self._tableAlias, column)
         
     def lookupDisplayNameByDbId(self, dbid):
         sql = self._buildSql(where='t1.dbid')
@@ -692,7 +716,7 @@ class UniqueKey(object):
         sql = self._buildSql(select='t1.dbid')
         return self.session.db().selectSingle(sql, displayName)
     
-    def _lookupDbIdFromForeignSessionSql(self, dbid, otherSession):
+    def _lookupDbIdFromForeignSessionSql(self, column, otherSession):
         # TODO: we should probably assert that our current session and the other
         # session are using identical schemas and database vendors.
         collateTo = False
@@ -815,7 +839,7 @@ class DynamicList(object):
            
     def __init__(self, name, values):
         self.Name = name
-        self.values = values
+        self.values = iterable(values)
         
     def __len__(self):
         return len(self.values)
@@ -874,6 +898,7 @@ def loadDynamicList(name, obj):
     values = [ v.text for v in xml.getchildren() if v.tag == expected ]
     return DynamicList(name, values)
 
+
 def loadDynamicLists(obj):
     if isinstance(obj, Session):
         return DynamicLists([
@@ -888,6 +913,8 @@ def loadDynamicLists(obj):
             xml = XML(obj)
     elif isinstance(obj, _Element):
         xml = obj
+    else:
+        raise RuntimeError("unknown type for obj: %s" % type(obj))
     
     expected = '{%s}DynamicLists' % CQXmlNamespaceUri
     if xml.tag != expected:
@@ -897,9 +924,8 @@ def loadDynamicLists(obj):
     valTag = '{%s}Value' % CQXmlNamespaceUri
     dynListTag = '{%s}DynamicList' % CQXmlNamespaceUri
     
-    #strip = lambda c: c.text.replace('\n', '').replace('\r', '')
-    strip = lambda c: c.text
-    values = lambda e: [ strip(c) for c in e.getchildren() if c.tag == valTag ]
+    def strip(c): return c.text
+    def values(e): return [strip(c) for c in e.getchildren() if c.tag == valTag]
     return DynamicLists([
         DynamicList(e.get('Name'), values(e))
             for e in xml.getchildren() if e.tag == dynListTag
@@ -2091,6 +2117,14 @@ class EntityActionHookEvents:
 class EntityDef(CQObject):
     CLSID = IID('{04A2C910-C552-11D0-A47F-00A024DED613}')
     coclass_clsid = IID('{04A2C920-C552-11D0-A47F-00A024DED613}')
+    
+    def __init__(self, *args, **kwds):
+        CQObject.__init__(self, *args, **kwds)
+        
+        self.__dict__.update(self.session.db().selectAllAsDict(
+            "SELECT * FROM entitydef WHERE name = ?",
+            self.GetName())[0]
+        )
 
     def CanBeSecurityContext(self):
         return self._oleobj_.InvokeTypes(22, LCID, 1, (11, 0), (),)
@@ -2238,9 +2272,8 @@ class EntityDef(CQObject):
     def lookupDbIdByDisplayName(self, displayName):
         return self.getUniqueKey().lookupDbIdByDisplayName(displayName)
 
-    @cache
-    @selectSingle
-    def getFieldDbName(self, fieldDefName): pass
+    def getFieldDbName(self, fieldDefName):
+        return self.getFieldNameToDbColumnMap().get(fieldDefName)
     
     @db.execute
     def disablePrimaryAndUniqueIndexes(self): pass
@@ -2282,7 +2315,27 @@ class EntityDef(CQObject):
     
     @selectSingle
     def getCount(self): pass
-
+    
+    @cache
+    def isReferenceField(self, fieldName):
+        return fieldName in self.getReferenceFieldNames()
+    
+    @cache
+    def isReferenceListField(self, fieldName):
+        return fieldName in self.getReferenceListFieldNames()
+    
+    @cache
+    def isBackReferenceField(self, fieldName):
+        return fieldName in self.getBackReferenceFieldNames()
+    
+    @cache
+    def isBackReferenceListField(self, fieldName):
+        return fieldName in self.getBackReferenceListFieldNames()
+    
+    @cache
+    def getFieldNameToDbColumnMap(self):
+        sql = 'SELECT name, db_name FROM fielddef WHERE entitydef_id = ?'
+        return dict(self.session.db().selectAll(sql, self.id))
 
 class EntityDefs(CQObject):
     CLSID = IID('{B9F132EB-96A9-11D2-B40F-00A0C9851B52}')
@@ -4735,6 +4788,10 @@ class Session(CQObject):
     @cache
     def connectString(self):
         return self.GetSessionDatabase().GetDatabaseConnectString()
+    
+    @cache
+    def connectStringToMap(self):
+        return connectStringToMap(self.connectString())
 
     @cache
     def db(self):
@@ -4821,6 +4878,9 @@ class Session(CQObject):
             self.DeleteListMember(name, value)
         
         return self.getDynamicList(name)
+    
+    def updateDynamicLists(self, dynamicLists):
+        return [ self.updateDynamicList(dl) for dl in dynamicLists ]
     
     def executeQuery(self, sql):
         r = self.BuildSQLQuery(sql)

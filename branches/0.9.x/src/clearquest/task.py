@@ -9,6 +9,7 @@ clearquest.task: module for simplifying ClearQuest migrations.
 import os, sys, time, traceback
 
 from itertools import count, repeat
+from pprint import pprint, pformat
 
 from lxml.etree import XML
 from os.path import basename, dirname
@@ -66,9 +67,16 @@ class Config(ConfigParser):
         """
         return option
     
+    def getDefaultConfigSection(self):
+        """
+        @return: a string representing the default configuration section the
+        get() method should use when attempting to fetch config values.
+        """
+        return 'DEFAULT'
+    
     def __getitem__(self, name):
         try:
-            return self.data[name]
+            return self.data[self.getDefaultConfigSection()][name]
         except KeyError:
             return self.default[name]
     
@@ -80,13 +88,6 @@ class TaskManagerConfig(Config):
             file = joinPath(manager.runDir, base[:base.rfind('.')] + '.ini')
         Config.__init__(self, file)
         
-    def getDefaultConfigSection(self):
-        """
-        @return: a string representing the default configuration section the
-        get() method should use when attempting to fetch config values.
-        """
-        return 'DEFAULT'
-    
     def tasks(self):
         """
         @return: list of class objects for each task defined in the current
@@ -159,14 +160,71 @@ class TaskManager(object):
     
     @cache
     def getDestSession(self, sessionClassType):
-        return self._getSession(sessionClassType, self.getDestConf())    
+        return self._getSession(sessionClassType, self.getDestConf())
     
     def createConfig(self):
         return TaskManagerConfig(self)
         
     def run(self):
         raise NotImplementedError
+
+class MultiSessionTaskManager(TaskManager):
+    """
+    Extended version of TaskManager that supports multiple user source sessions
+    and a single user destination session.  
+    """
     
+    def __init__(self, *args):
+        TaskManager.__init__(self, *args)
+        self._validateConf()
+    
+    def _validateConf(self):
+        """
+        Raises a KeyError exception if any of our mandatory configuration vars
+        aren't present in our config file.  Called from __init__().
+        """
+        self.conf['dbset']
+        self.conf['login']
+        self.conf['passwd']
+        self.conf['destSession']
+        self.conf['sourceSessions']
+        
+    def _getSession(self, db):
+        details = self.conf.data[self.conf.getDefaultConfigSection()]
+        details['db'] = db
+        fmt = "Logging on to user database %(db)s [%(dbset)s] as " \
+              "%(login)s/%(passwd)s..."
+        self.cb.write(fmt % details)
+        start = time.time()
+        session = api.getSession(api.SessionClassType.User, details)
+        self.cb.write("done (%.3f secs)\n" % (time.time() - start))
+        return session
+    
+    @cache
+    def getSourceSessions(self):
+        return [
+            self.getSourceSession(db)
+                for db in self.conf['sourceSessions']
+        ]
+    
+    @cache
+    def getSourceSession(self, db):
+        if db not in self.conf['sourceSessions']:
+            raise RuntimeError("Unknown database: %s" % db)
+        return self._getSession(db)
+    
+    @cache
+    def getDestSession(self, sessionClassType):
+        return self._getSession(self.conf['destSession'])
+    
+    def getSourceSession(self, sessionClassType):
+        raise NotImplementedError
+    
+    def getSourceConf(self):
+        return self.conf
+    
+    def getDestConf(self):
+        return self.conf
 
     
 class Task(object):

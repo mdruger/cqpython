@@ -6,16 +6,21 @@ clearquest.merge: module for merging ClearQuest databases
 # Imports
 #===============================================================================
 
+import os
 import sys
+import time
 import itertools
-from itertools import repeat
+from itertools import chain, repeat
 import cStringIO as StringIO
 
 from pywintypes import com_error
+from pprint import pprint
+from subprocess import Popen, PIPE
 
 from clearquest import api, db
-from clearquest.task import Task, TaskManager
-from clearquest.util import connectStringToMap, listToMap
+from clearquest.task import Task, TaskManagerConfig, MultiSessionTaskManager
+from clearquest.util import connectStringToMap, joinPath, listToMap, unzip, \
+                            exportQueries, updateQueries
 from clearquest.constants import EntityType, FieldType, SessionClassType
 
 #===============================================================================
@@ -25,14 +30,23 @@ __rcsid__ = '$Id$'
 __rcsurl__ = '$URL$'
 __copyright__ = 'Copyright 2008 OnResolve Ltd'
 
-__orig_db   = 'merge_orig_db'
-__orig_id   = 'merge_orig_id'
-__orig_dbid = 'merge_orig_dbid'
+__mergeDbField   = 'merge_orig_db'
+__mergeIdField   = 'merge_orig_id'
+__mergeDbIdField = 'merge_orig_dbid'
 
-MergeFields = {
-    __orig_db    : FieldType.Integer,
-    __orig_dbid  : FieldType.Integer,
-}
+__statelessDbIdMapTableName = 'merge_aux_map'
+__statelessDbIdMapMaxUniqueKeyLength = 250
+
+__userBucketMapTableName = 'merge_bucket_usage'
+
+__useClusteredIndexes = False
+
+__defaultFillFactor = 85
+
+Stateful  = api.EntityType.Stateful
+Stateless = api.EntityType.Stateless
+SQLServer = api.DatabaseVendor.SQLServer
+Oracle    = api.DatabaseVendor.Oracle
 
 #===============================================================================
 # Decorators
@@ -41,6 +55,7 @@ MergeFields = {
 #===============================================================================
 # Helper Methods
 #===============================================================================
+    
 def findSql(name, *args, **kwds):
     try:
         session = kwds['session']
@@ -50,33 +65,239 @@ def findSql(name, *args, **kwds):
             session = sys._getframe().f_back.f_locals['session']
         except:
             session = sys._getframe().f_back.f_locals['destSession']
-    return db._findSql(session, 'merge', name, *args, **kwds)
+    sql = db._findSql(session, 'merge', name, *args, **kwds)
+    if sql.endswith('\n'):
+        return sql[:-1]
+    else:
+        return sql
 
-@db.getSql
-def createDbIdMaps(session):
-    auxSql = findSql('selectAuxDbIds') 
-    reqSql = findSql('selectReqDbIds')
-    return {
-        'auxTable'  :   'merge_aux_dbids',
-        'reqTable'  :   'merge_req_dbids',
-        'auxSelect' :   '\nUNION\n'.join([
-                            auxSql % (e.GetName(), e.GetDbName()) 
-                                for e in session.getStatelessEntityDefs() ]),
-        'reqSelect' :   '\nUNION\n'.join([
-                            reqSql % e.GetDbName()
-                                for e in session.getStatefulEntityDefs() ]),
-    }
+def _innerJoin(*args):
+    return __getJoinSql('INNER JOIN', args)
 
-@db.execute
-def deleteAllStatefulEntitiesWhereIdStartsWith(session, prefix):
+def _rightOuterJoin(*args):
+    return __getJoinSql('RIGHT OUTER JOIN', args)
+        
+def __getJoinSql(joinType, targets, indent=0):
+    _indent = lambda i: ' ' * (4 * (indent+i))
+    for (table, predicate) in targets:
+        yield '%s%s\n%s%s ON\n%s%s' % (
+            _indent(0),
+            joinType,
+            _indent(1),
+            table,
+            _indent(2),
+            predicate
+        )
+
+def _getStatelessMapKwds(dbidOffsets, destSession, *args):
+    
     return {
-        'prefix': prefix,
-        'tableNames': [ e.GetDbName() for e in session.getStatefulEntityDefs() ]
+        'dbidOffsets' : dbidOffsets,
+        'statelessDbIdMapMaxUniqueKeyLength' : \
+            __statelessDbIdMapMaxUniqueKeyLength,
+        'statelessDbIdMapTableName' : '%s.%s' % (   
+            destSession.getTablePrefix(),
+            __statelessDbIdMapTableName
+        )
     }
-   
-@db.getSql
-def insertEntity(destSession, sourceSession, entityDefName):
+def _getUserBucketMapKwds(dbidOffsets, destSession, *args):
+    k = { 
+        'shortName' : __userBucketMapTableName,
+        'userBucketMapTableName' : '%s.%s' % (
+            destSession.getTablePrefix(),
+            __userBucketMapTableName,
+        )
+    }
+    k.update(_getStatelessMapKwds(dbidOffsets, destSession))
+    return k
+
+def _getOffsetDecoder(session):
+    vendor = session.getDatabaseVendor()
+    if vendor == SQLServer:
+        f = lambda c, o: \
+            '(CASE WHEN %s = 0 THEN 0 ELSE %s + %d END)' % (c, c, o)
+    elif vendor == Oracle:
+        f = lambda c, o: \
+          '({fn DECODE(%s, 0, 0, %s + %d)})' % (c, c, o)
+    else:
+        raise NotImplementedError
+    return lambda c, o: f(c, o) if o != 0 else c
+
+def _getIdUpdater(session):
+    vendor = session.getDatabaseVendor()
+    if vendor == SQLServer:
+        return lambda n, d: \
+                  "'%s' + REPLICATE(0,8-LEN(CAST((%s-33554432) AS VARCHAR)))+" \
+                  "CAST((%s-33554432) AS VARCHAR)" % (n, d, d)
+    else:
+        raise NotImplementedError
+    return f
+@api.cache
+def _getDbIdColumn(session):
+    return '%s_dbid' % session._databaseName.lower()
+
+@api.cache
+def _chainedSessions(destSession, sourceSessions):
+    if getMaxStatefulEntityDbIds((destSession,)).next() != 0:
+        return chain((destSession,), sourceSessions)
+    else:
+        return sourceSessions
+    
+def _createStatelessDbIdMap(destSession, sourceSessions, dbidOffsets):
+    
+    args = destSession, sourceSessions
+    k = dict(_getStatelessMapKwds(dbidOffsets, *args))
+    
+    sql = [ _createStatelessDbIdMapTable(*args, **k) ] + \
+          [ i for i in _insertIntoStatelessDbIdMap(*args, **k) ] + \
+          [ u for u in _updateStatelessDbIdMap(*args, **k) ] + \
+          [ _createStatelessDbIdMapIndexes(*args, **k) ] 
+    
+    return '\nGO\n'.join(sql)
+    
+def _updateStatelessDbIdMap(destSession, sourceSessions, **kwds):
+    args = (destSession, sourceSessions, findSql('updateStatelessDbIdMap'))
+    return __constructStatelessDbIdSql(*args, **kwds)
+
+def _insertIntoStatelessDbIdMap(destSession, sourceSessions, **kwds):
+    args = (destSession, sourceSessions, findSql('insertIntoStatelessDbIdMap'))
+    return __constructStatelessDbIdSql(*args, **kwds)
+    
+def _createStatelessDbIdMapTable(destSession, sourceSessions, **kwds):
+    sessions = _chainedSessions(destSession, sourceSessions)
+    k = {
+        'replicaIds'     : [ api.Session.getReplicaId(s) for s in sessions ],
+        'dstTablePrefix' : destSession.getTablePrefix(),
+        'dboTablePrefix' : destSession.db().getDboTablePrefix(),
+        'dbDbIdColumns'  : [ _getDbIdColumn(s) for s in sessions ],
+    }
+    k.update(kwds)
+    k['shortName'] = k['statelessDbIdMapTableName'].split('.')[-1]
+    return findSql('createStatelessDbIdMap', **k) % k
+
+def _createStatelessDbIdMapIndexes(destSession, sourceSessions, **kwds):
+    sessions = _chainedSessions(destSession, sourceSessions)
+    k = { 'dbDbIdColumns' : [ _getDbIdColumn(s) for s in sessions ] }
+    k.update(kwds)
+    return findSql('createStatelessDbIdMapIndexes', **k) % k
+
+    
+def __constructStatelessDbIdSql(destSession, sourceSessions, sql, **kwds):
+    
+    defaultCollation = destSession.getCollation()
+    SQLServer = api.DatabaseVendor.SQLServer
+    sessions = _chainedSessions(destSession, sourceSessions)
+    k = dict(kwds)
+    dbidOffsets = iter(k['dbidOffsets'])
+    
+    for session in sessions:
+        dbidOffset = dbidOffsets.next()
+        vendor = session.getDatabaseVendor()
+        collationCast = None
+        if vendor == SQLServer and session.getCollation() != defaultCollation:
+            collationCast = ' COLLATE %s' % defaultCollation
+            
+        dbName = session._databaseName
+        k['dbName'] = dbName
+        k['dbDbIdColumn'] = _getDbIdColumn(session)
+
+        p = session.getTablePrefix()
+        if session is not destSession:
+            p = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        
+        for entityDef in session.getStatelessEntityDefs():
+            if entityDef.name in ('attachments', 'history', 'ratl_replicas'):
+                continue
+            
+            k['entityDefId'] = entityDef.id
+            
+            uniqueKey = entityDef.getUniqueKey()
+            displayNameSql = uniqueKey._getDisplayNameSql()
+            if uniqueKey.hasTextColumnsInKey() and collationCast:
+                displayNameSql += collationCast
+            k['uniqueKeyDisplayNameSql'] = \
+                '{fn CONVERT((%s), SQL_VARCHAR)}' % displayNameSql
+            
+            if dbidOffset == 0:
+                k['targetDbId'] = 't1.dbid'
+            else:
+                k['targetDbId'] = '(t1.dbid + %d)' % dbidOffset 
+                
+            info = uniqueKey._info()
+            joins = [ '%s.%s' % (p, j[j.rfind('.')+1:]) for j in info['joins'] ]
+            k['from'] = ', '.join(joins)
+            
+            k['where'] = 't1.dbid <> 0 AND '
+            where = info['where']
+            if where:
+                k['where'] += ' AND '.join(where) + ' AND '
+            
+            yield sql % k
+            
+def _createUserBucketMap(destSession, sourceSessions, dbidOffsets):
+    
+    args = destSession, sourceSessions
+    k = dict(_getUserBucketMapKwds(dbidOffsets, *args))
+    
+    sql = [ _createUserBucketMapTable(*args, **k) ] + \
+          [ i for i in _insertIntoUserBucketMap(*args, **k) ] + \
+          [ u for u in _updateUserBucketMap(*args, **k) ] + \
+          [ _createUserBucketMapIndexes(*args, **k) ] 
+    
+    return '\nGO\n'.join(sql)
+    
+def _updateUserBucketMap(destSession, sourceSessions, **kwds):
+    args = (destSession, sourceSessions, findSql('updateUserBucketMap'))
+    return __constructUserBucketSql(*args, **kwds)
+
+def _insertIntoUserBucketMap(destSession, sourceSessions, **kwds):
+    args = (destSession, sourceSessions, findSql('insertIntoUserBucketMap'))
+    return __constructUserBucketSql(*args, **kwds)
+    
+def _createUserBucketMapTable(destSession, sourceSessions, **kwds):
+    sessions = _chainedSessions(destSession, sourceSessions)
+    k = { 'dboTablePrefix' : destSession.db().getDboTablePrefix() }
+    k.update(kwds)
+    return findSql('createUserBucketMap') % k
+
+def _createUserBucketMapIndexes(destSession, sourceSessions, **kwds):
+    sessions = _chainedSessions(destSession, sourceSessions)
+    return findSql('createUserBucketMapIndexes') % kwds
+    
+def __constructUserBucketSql(destSession, sourceSessions, sql, **kwds):
+    
+    sessions = _chainedSessions(destSession, sourceSessions)
+    k = dict(kwds)
+    k['dstPrefix'] = destSession.getTablePrefix()
+    
+    for session in sessions:
+        p = session.getTablePrefix()
+        if session is not destSession:
+            p = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        k['srcPrefix'] = p
+        k['dbDbIdColumn'] = _getDbIdColumn(session)
+            
+        yield sql % k            
+        
+def _mergeEntity(destSession, sourceSession, entityDefName, dbidOffset):
+    """
+    Generates SQL necessary to merge all entities of type @param entityDefName
+    from @param sourceSession into @param destSession.  For stateless entities,
+    the generated SQL ensures each entity will only be brought over if there's
+    no corresponding entity with the same unique ID present in the database.
+    
+    @param dbidOffset is an integer that is added to references.
+    
+    Note that the generated SQL only brings over fields that are actual columns
+    on the underlying entity table.  i.e. attachments and parent/child links 
+    aren't brought over by this method.
+    """
+    srcDbName = sourceSession._databaseName
+    dstDbName = destSession._databaseName
+    dstReplicaId = str(destSession.getReplicaId())
     entityDef = destSession.GetEntityDef(entityDefName)
+    entityDbName = entityDef.db_name
+    entityDefType = entityDef.GetType()
     uniqueKey = entityDef.getUniqueKey()
     requiresCollation = False
     destCollation = destSession.getCollation()
@@ -84,64 +305,691 @@ def insertEntity(destSession, sourceSession, entityDefName):
     if destCollation != sourceCollation:
         requiresCollation = bool(uniqueKey._info()['text'])
     
-    columns = [
-        entityDef.getFieldDbName(f)
-            for f in entityDef.GetFieldDefNames()
-                if entityDef.GetFieldDefType(f) in [
-                    FieldType.ShortString,
-                    FieldType.MultilineString,
-                    FieldType.Integer,
-                    FieldType.DateTime,
-                    FieldType.State,
-                    FieldType.Id,
-                ]
-    ]
+    # Fields of the following types can be copied over directly.  They require
+    # no translation, unlike id/dbid fields.
+    straightCopyFieldTypes = (
+        FieldType.ShortString,
+        FieldType.MultilineString,
+        FieldType.Integer,
+        FieldType.DateTime,
+        FieldType.State,
+    )
     
-    entityDbName = entityDef.GetDbName()
-    srcPrefix = sourceSession.getTablePrefix().upper()
-    dstPrefix = destSession.getTablePrefix().upper()
-    srcTable = '.'.join((srcPrefix, entityDbName))
-    dstTable = '.'.join((dstPrefix, entityDbName))
+    args = (sourceSession, (destSession,))
+    dstTablePrefix = destSession.getTablePrefix()
+    srcTablePrefix = api.getLinkedServerAwareTablePrefix(*args)
     
-    ddb = destSession.db()
-    addOldDbId = False
-    if not '__old_dbid' in [ c[0] for c in ddb.columns(entityDef.GetDbName()) ]:
-        addOldDbId = True
+    dbName = destSession._databaseName.lower()
+    auxMapTable = '%s.%s' % (dstTablePrefix, __statelessDbIdMapTableName) 
     
-    where = 'WHERE src.dbid <> 0'
-    dbidColumn = 'src.dbid'
-    dstSql = uniqueKey._buildSql(select='t1.dbid')[:-1]
-    srcSql = sourceSession.GetEntityDef(entityDefName)      \
-                          .getUniqueKey()                   \
-                          ._buildSql(where='t1.dbid')[:-1]
+    _decodeOffset = _getOffsetDecoder(destSession)
+    _updateId = _getIdUpdater(destSession)
     
-    if requiresCollation:
-        srcSql = srcSql.replace('FROM', 'COLLATE %s FROM' % destCollation)
-                          
-    if entityDef.GetType() == EntityType.Stateless:
-        where += ' AND NOT EXISTS (%s(%ssrc.dbid))' % (dstSql, srcSql)
-    else:
-        dbidColumn = '(CASE WHEN EXISTS (%s) THEN (%s) ELSE src.dbid END)' % (\
-            'SELECT 1 FROM %s WHERE dbid = src.dbid' % dstTable,
-            'SELECT 1+(SELECT MAX(dbid) FROM %s) FROM dbglobal' % dstTable
+    c = itertools.count(1)
+    
+    joins = list()
+    srcColumns = list()
+    dstColumns = list()
+    
+    dbColumns = entityDef.getFieldNameToDbColumnMap()
+    
+    for fieldName in entityDef.GetFieldDefNames():
+        
+        fieldType = entityDef.GetFieldDefType(fieldName)
+        
+        dst = dbColumns.get(fieldName)
+        src = None
+        
+        if fieldName == __mergeDbField:
+            src = "'%s'" % srcDbName
+            
+        elif fieldName == __mergeIdField:
+            src = 'src.id'
+        
+        elif fieldName == __mergeDbIdField:
+            src = 'src.dbid'
+        
+        elif fieldName in ('ratl_mastership', 'ratl_keysite'):
+            src = dstReplicaId
+            
+        elif fieldType in straightCopyFieldTypes:
+            src = 'src.%s' % dst
+            
+        elif fieldType == FieldType.Id:
+            if dbidOffset:
+                dbid = '(src.dbid + %d)' % dbidOffset
+            else:
+                dbid = 'src.dbid'
+                
+            src = _updateId(dstDbName, dbid)
+            
+        elif fieldType == FieldType.DbId:
+            if dbidOffset:
+                src = '(src.dbid + %d)' % dbidOffset
+            else:
+                src = 'src.dbid'
+                
+        elif fieldType == FieldType.Reference:
+            if entityDef.isReferenceField(fieldName):
+                refEntityDef = entityDef.GetFieldReferenceEntityDef(fieldName)
+                refEntityDefType = refEntityDef.GetType()
+                if refEntityDefType == Stateful:
+                    if dbidOffset:
+                        src = _decodeOffset('src.%s' % dst, dbidOffset)
+                    else:
+                        src = 'src.%s' % dst
+                else:
+                    alias = 'm%d' % c.next()
+                    src = '%s.dbid' % alias
+                    joins.append((alias, (dst, refEntityDef.id)))
+                    
+            else:
+                print "skipping field %s: field type is reference but " \
+                      "isReferenceField() returned false"
+        
+        if src:
+            dstColumns.append(dst)
+            srcColumns.append(src)
+    
+    
+    where = list()
+    srcDbId = _getDbIdColumn(sourceSession)
+    srcTables = list()
+    srcTables.append('%s.%s src' % (srcTablePrefix, entityDbName))
+    for (alias, (column, eid)) in joins:
+        srcTables.append('%s %s' % (auxMapTable, alias))
+        where.append('%s.%s = src.%s AND %s.entitydef_id = %d' % \
+                     (alias, srcDbId, column, alias, eid))
+        
+    where.append('src.dbid <> 0')
+    if entityDefType == EntityType.Stateless:
+        # Make sure we only insert stateless entities where we're listed as the
+        # owner for in the merged dbid map.
+        alias = 'm%d' % c.next()
+        srcTables.append('%s %s' % (auxMapTable, alias))
+        if dbidOffset:
+            src = '(src.dbid + %d)' % dbidOffset
+        else:
+            src = 'src.dbid'
+        where.append('%s.ratl_mastership = src.ratl_mastership AND '           \
+                     '%s.%s = src.dbid AND %s.dbid = %s AND '                  \
+                     '%s.entitydef_id = %d' %                                  \
+                     (alias, alias, srcDbId, alias, src, alias, entityDef.id))
+        
+    kwds = {
+        'where'      : ' AND\n    '.join(where),
+        'dstTable'   : '%s.%s' % (dstTablePrefix, entityDbName),
+        'orderBy'    : 'src.dbid ASC',
+        'srcTables'  : ',\n    '.join(srcTables),
+        'dstColumns' : ',\n    '.join(dstColumns),
+        'srcColumns' : ',\n    '.join(srcColumns),
+    }
+    
+    return findSql('mergeEntity') % kwds
+
+def _mergeHistory(destSession, sourceSessions, dbidOffsets):
+    """
+    """
+    offsets = iter(dbidOffsets)
+    dstReplicaId = destSession.getReplicaId()
+    dstPrefix = destSession.getTablePrefix()
+    auxMapTable = '%s.%s' % (dstPrefix, __statelessDbIdMapTableName)
+    
+    defaultColumns = (
+        ('old_state', 'src.old_state'),
+        ('new_state', 'src.new_state'),
+        ('action_name', 'src.action_name'),
+        ('ratl_keysite', str(dstReplicaId)),
+        ('entitydef_id', 'src.entitydef_id'),
+        ('entitydef_name', 'src.entitydef_name'),
+        ('ratl_mastership', str(dstReplicaId)),
+        ('action_timestamp', 'src.action_timestamp'),
+        ('expired_timestamp', 'src.expired_timestamp'),
+    )
+    
+    user = "{fn CONCAT({fn LEFT(src.user_name, %d)}, ' (%s)')}"
+    
+    for session in sourceSessions:
+        
+        dbidOffset = offsets.next()
+        srcDbName = session._databaseName
+        srcDbId = _getDbIdColumn(session)
+        srcPrefix = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        
+        entityTypes = {
+            Stateless : ('m1.dbid', True),
+            Stateful  : ('(src.entity_dbid + %d)' % dbidOffset, False),
+        }
+        
+        for (entityType, (column, joinAuxMap)) in entityTypes.items():
+            columns = list(defaultColumns)
+            columns.append(('user_name', user % (27-len(srcDbName),srcDbName)))
+            
+            columns.append(('dbid', '(src.dbid + %d)' % dbidOffset))
+            columns.append(('entity_dbid', column))
+            
+            where = list()
+            where.append('src.entitydef_id = e1.id')
+            where.append('e1.type = %d AND e1.is_family = 0' % entityType)
+            
+            srcTables = list()
+            srcTables.append('%s.history src' % srcPrefix)
+            srcTables.append('%s.entitydef e1' % dstPrefix)
+            if joinAuxMap:
+                srcTables.append('%s m1' % auxMapTable)
+                where.append('m1.%s = src.entity_dbid ' % srcDbId)
+                where.append('m1.entitydef_id = src.entitydef_id')
+            
+            (dstColumns, srcColumns) = unzip(columns)
+            
+            kwds = {
+                'where'      : ' AND\n    '.join(where),
+                'orderBy'    : 'src.dbid ASC',
+                'dstTable'   : '%s.history' % dstPrefix,
+                'srcTables'  : ',\n    '.join(srcTables),
+                'dstColumns' : ',\n    '.join(dstColumns),
+                'srcColumns' : ',\n    '.join(srcColumns),
+            }
+            
+            yield findSql('mergeEntity') % kwds
+
+def _mergeParentChildLinks(destSession, sourceSessions, dbidOffsets):
+    """
+    """
+    offsets = iter(dbidOffsets)
+    prefixes = ('parent', 'child')
+    
+    # We need to discern between stateful/stateless and User/Group for our final
+    # iteration, so use some meaningful aliases such that the code in the loop
+    # below looks a little less obtuse.
+    User = -Stateless
+    Group = -Stateless
+    linkTypes = (
+        (Stateful, Stateful),
+        (Stateful, Stateless),
+        (Stateless, Stateful),
+        (Stateless, Stateless),
+        (User, Group),
+    )    
+   
+    _decodeOffset = _getOffsetDecoder(destSession)
+    
+    for sourceSession in sourceSessions:
+        
+        dbidOffset = offsets.next()
+        srcDbId = '%s_dbid' % sourceSession._databaseName.lower()
+        
+        for linkType in linkTypes:
+    
+            joins = list()
+            where = list()
+            dstColumns = list()
+            srcColumns = list()
+            m = itertools.count(1)
+            e = itertools.count(1)
+            exclude = { 'exclude' : True }
+            
+            for (prefix, link) in zip(prefixes, linkType):
+                dst = '%s_dbid' % prefix
+                alias = 'e%d' % e.next()
+                joins.append((alias, 'entitydef')) 
+                
+                if prefix == 'child' and link == Group:
+                    where.append("%s.name = 'groups'" % alias)
+                else:
+                    where += [
+                        '%s.id = src.%s_entitydef_id' % (alias,prefix),
+                        '%s.type = %d AND %s.is_family = 0' % \
+                            (alias, abs(link), alias)
+                    ]
+                
+                entityDefAlias = alias
+                
+                if link == Stateful:
+                    if dbidOffset:
+                        src = _decodeOffset('src.%s_dbid' % prefix, dbidOffset)
+                    else:
+                        src = 'src.%s_dbid' % prefix
+                else:
+                    alias = 'm%d' % m.next()
+                    src = '%s.dbid' % alias
+                    joins.append((alias, __statelessDbIdMapTableName))
+                    where.append('%s.%s = src.%s_dbid' % \
+                                 (alias, srcDbId, prefix))                    if link != Group:
+                        where.append('%s.entitydef_id = src.%s_entitydef_id' % \
+                                     (alias, prefix))
+                    else:
+                        where.append('%s.entitydef_id = %s.id' % \
+                                     (alias, entityDefAlias))
+                
+                dstColumns.append(dst)
+                srcColumns.append(src)
+                
+                for other in ('_entitydef_id', '_fielddef_id'):
+                    dstColumns.append('%s%s'     % (prefix, other))
+                    srcColumns.append('src.%s%s' % (prefix, other))
+                
+                exclude[prefix] = src
+            
+            dstColumns.append('link_type_enum')
+            srcColumns.append('1')
+            
+            if linkType not in ((Stateless, Stateless), (User, Group)):
+                exclude['exclude'] = False
+                
+            args = (sourceSession, (destSession,))
+            srcTablePrefix = api.getLinkedServerAwareTablePrefix(*args)
+            dstTablePrefix = destSession.getTablePrefix()
+            
+            srcTables = list()
+            srcTables.append('%s.parent_child_links src' % srcTablePrefix)
+            
+            for (alias, table) in joins:
+                srcTables.append('%s.%s %s' % (dstTablePrefix, table, alias))
+            
+            kwds = {
+                'where'      : ' AND\n    '.join(where),
+                'dstTable'   : '%s.parent_child_links' % dstTablePrefix,
+                'srcTables'  : ',\n    '.join(srcTables),
+                'dstColumns' : ',\n    '.join(dstColumns),
+                'srcColumns' : ',\n    '.join(srcColumns),
+            }
+            
+            yield findSql('mergeParentChildLinks', **exclude) % kwds
+
+def _mergeEntities(destSession, sourceSessions, dbidOffsets):
+    
+    offsets = iter(dbidOffsets)
+    for sourceSession in sourceSessions:
+        offset = offsets.next()
+        for entityDef in destSession.getAllEntityDefs():
+            entityDefName = entityDef.GetName()
+            if entityDefName in ('history', 'ratl_replicas'):
+                continue
+            yield _mergeEntity(destSession, sourceSession, entityDefName,offset)
+    
+def _mergeAttachments(destSession, sourceSessions, dbidOffsets):
+    offsets = iter(dbidOffsets)
+    dstPrefix = destSession.getTablePrefix()
+    auxMapTable = '%s.%s' % (dstPrefix, __statelessDbIdMapTableName)    
+    
+    defaultColumns = (
+        ('filename', 'src.filename'),
+        ('filesize', 'src.filesize'),
+        ('description', 'src.description'),
+        ('entity_fielddef_id', 'src.entity_fielddef_id'),
+    )
+    
+    defaultBlobColumns = (
+        ('data', 'src.data'),
+        ('entity_dbid', 'a1.entity_dbid'),
+        ('attachments_dbid', 'a1.dbid'),
+        ('entity_fielddef_id', 'a1.entity_fielddef_id'),
+    )
+    
+    (dstBlobColumns, srcBlobColumns) = unzip(defaultBlobColumns)
+    
+    for session in sourceSessions:
+        
+        dbidOffset = offsets.next()
+        srcDbName = session._databaseName
+        srcDbId = _getDbIdColumn(session)
+        srcPrefix = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        
+        entityTypes = {
+            Stateless : ('m1.dbid', True),
+            Stateful  : ('(src.entity_dbid + %d)' % dbidOffset, False),
+        }
+        
+        for (entityType, (column, joinAuxMap)) in entityTypes.items():
+            columns = list(defaultColumns)
+            
+            columns.append(('dbid', '(src.dbid + %d)' % dbidOffset))
+            columns.append(('entity_dbid', column))
+            
+            where = list()
+            where.append('f1.id = src.entity_fielddef_id')
+            where.append('e1.id = f1.entitydef_id')
+            where.append('e1.type = %d AND e1.is_family = 0' % entityType)
+            
+            srcTables = list()
+            srcTables.append('%s.attachments src' % srcPrefix)
+            srcTables.append('%s.fielddef f1' % dstPrefix)
+            srcTables.append('%s.entitydef e1' % dstPrefix)
+            if joinAuxMap:
+                srcTables.append('%s m1' % auxMapTable)
+                where.append('m1.%s = src.entity_dbid ' % srcDbId)
+                where.append('m1.entitydef_id = e1.id')
+                
+            (dstColumns, srcColumns) = unzip(columns)
+
+            kwds = {
+                'where'      : ' AND\n    '.join(where),
+                'orderBy'    : 'src.dbid ASC',
+                'dstTable'   : '%s.attachments' % dstPrefix,
+                'srcTables'  : ',\n    '.join(srcTables),
+                'dstColumns' : ',\n    '.join(dstColumns),
+                'srcColumns' : ',\n    '.join(srcColumns),
+            }
+            
+            yield findSql('mergeEntity') % kwds
+        
+        # Merging attachments_blob only requires one SQL statement per source
+        # session as we join on the attachments table, inserted above.
+        srcTables = list()
+        srcTables.append('%s.attachments_blob src' % srcPrefix)
+        srcTables.append('%s.attachments a1' % dstPrefix)
+        
+        where = list()
+        where.append('a1.dbid = (src.attachments_dbid + %d)' % dbidOffset)
+        where.append('src.entity_fielddef_id = a1.entity_fielddef_id')
+        
+        kwds = {
+            'where'      : ' AND\n    '.join(where),
+            'orderBy'    : 'a1.dbid ASC',
+            'dstTable'   : '%s.attachments_blob' % dstPrefix,
+            'srcTables'  : ',\n    '.join(srcTables),
+            'dstColumns' : ',\n    '.join(dstBlobColumns),
+            'srcColumns' : ',\n    '.join(srcBlobColumns),
+        }
+        
+        yield findSql('mergeEntity') % kwds
+
+def _mergeUserBuckets(destSession, sourceSessions, dbidOffsets):
+    dstPrefix = destSession.getTablePrefix()
+    dstReplicaId = str(destSession.getReplicaId())
+    dstCollation = destSession.getCollation()
+    auxMapTable = '%s.%s' % (dstPrefix, __statelessDbIdMapTableName)
+    bucketMapTable = '%s.%s' % (dstPrefix, __userBucketMapTableName)
+    
+    defaultColumns = (
+        ('type', 'src.type'),
+        ('user_id', 'm1.dbid'),
+        ('subtype', 'src.subtype'),
+        ('data_length', 'src.data_length'),
+        ('ratl_keysite', dstReplicaId),
+        ('entitydef_id', 'src.entitydef_id'),
+        ('ratl_mastership', dstReplicaId),
+        ('package_ownership', 'src.package_ownership'),
+    )
+    
+    decodeNameForPrimaries = findSql('decodeNameForPrimaryUserBuckets')
+    decodeNameForSecondaries = findSql('decodeNameForSecondaryUserBuckets')
+    decodeParentForSecondaries = findSql('decodeParentForSecondaryUserBuckets')
+    
+    # Merging user buckets is a two part process.  We create a 'bucket usage
+    # map' earlier on in the merge process that records which database the
+    # user has the most buckets in (i.e. queries, preferences etc).  This
+    # database is treated as their primary database and all buckets from it
+    # are imported. The first bit of SQL generation logic below handles this
+    # task.  The second part of the process is bringing over queries that
+    # were associated with them in their non-primary database.  A folder is
+    # created under their 'Personal Queries' folder named 'Merged <dbname>
+    # Queries', which contains their queries from the other databases.
+
+    offsets = iter(dbidOffsets)
+    for session in sourceSessions:
+        srcPrefix = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        dbidOffset = offsets.next()
+        decodeOffset = _getOffsetDecoder(session)
+        dbDbIdColumn = _getDbIdColumn(session)
+        srcReplicaId = session.getReplicaId()
+        collationCast = ''
+        if session.getCollation() != dstCollation:
+            collationCast = ' COLLATE %s' % dstCollation
+        
+        expand = lambda s: (s, decodeOffset('src.%s' % s, dbidOffset))
+        columns = list(defaultColumns)
+        columns += [
+            expand('dbid'),
+            expand('data_id'),
+            expand('query_bucket_id'),
+            expand('parent_bucket_id'),
+            ('name', decodeNameForPrimaries % (dstPrefix, collationCast)),
+        ]
+        (dstColumns, srcColumns) = unzip(columns)
+        
+        srcTables = (
+            '%s m1' % auxMapTable, 
+            '%s b1' % bucketMapTable, 
+            '%s.bucket src' % srcPrefix,
+        )
+               
+        where = (
+            'b1.dbid = m1.dbid',
+            'm1.%s = src.user_id' % dbDbIdColumn,
+            'b1.ratl_mastership = src.ratl_mastership',
+        )            
+        
+        kwds = {
+            'where'      : ' AND\n    '.join(where),
+            'orderBy'    : 'src.dbid ASC',
+            'dstTable'   : '%s.bucket' % dstPrefix,
+            'srcTables'  : ',\n    '.join(srcTables),
+            'dstColumns' : ',\n    '.join(dstColumns),
+            'srcColumns' : ',\n    '.join(srcColumns),
+        }
+        
+        yield findSql('mergeEntity') % kwds
+        
+    # Now for part two: importing queries present in the user's non-primary
+    # database, but making sure they live under a new folder names 'Merged
+    # <dbname> Queries' (which we also ensure lives under the root 'Personal
+    # Queries' folder for the user in the merged database).
+    offsets = iter(dbidOffsets)
+    for session in sourceSessions:
+        dbName = session._databaseName
+        srcPrefix = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        dbidOffset = offsets.next()
+        decodeOffset = _getOffsetDecoder(session)
+        dbDbIdColumn = _getDbIdColumn(session)
+        srcReplicaId = session.getReplicaId()
+        
+        expand = lambda s: (s, decodeOffset('src.%s' % s, dbidOffset))
+        
+        decodeName = decodeNameForSecondaries % dbName
+        decodeParent = decodeParentForSecondaries % \
+            (dstPrefix, 'src.parent_bucket_id + %d' % dbidOffset)
+        
+        columns = list(defaultColumns)
+        columns += [
+            expand('dbid'),
+            expand('data_id'),
+            expand('query_bucket_id'),
+            ('name', decodeName),
+            ('parent_bucket_id', decodeParent),
+        ]
+        (dstColumns, srcColumns) = unzip(columns)
+        
+        srcTables = (
+            '%s m1' % auxMapTable, 
+            '%s b1' % bucketMapTable, 
+            '%s.bucket src' % srcPrefix,
         )
         
-    dstColumns = columns + [ '__old_dbid', 'dbid' ]
-    srcColumns = [ 'src.%s' % c for c in columns ] + [ 'src.dbid', dbidColumn ]
+        # We only copy the following types of buckets from secondary databases:
+        #   1:   queries
+        #   2:   charts
+        #   4:   folders
+        #   256: report
+        #   512: report format
+        where = (
+            'src.type IN (1, 2, 4, 256, 512)',
+            'b1.ratl_mastership <> src.ratl_mastership',
+            'm1.%s = src.user_id' % dbDbIdColumn,
+            'b1.dbid = m1.dbid'
+        )
+        
+        kwds = {
+            'where'      : ' AND\n    '.join(where),
+            'orderBy'    : 'src.dbid ASC',
+            'dstTable'   : '%s.bucket' % dstPrefix,
+            'srcTables'  : ',\n    '.join(srcTables),
+            'dstColumns' : ',\n    '.join(dstColumns),
+            'srcColumns' : ',\n    '.join(srcColumns),
+        }
+        
+        yield findSql('mergeEntity') % kwds
+        
+    # And finally, generate SQL statements to copy the user_blob data over for
+    # the final set of merged queries.
+    offsets = iter(dbidOffsets)
+    for session in sourceSessions:
+        srcPrefix = api.getLinkedServerAwareTablePrefix(session, (destSession,))
+        dbidOffset = offsets.next()
+        
+        offset = '(src.dbid + %d)' % dbidOffset
+        columns = (
+            ('data', 'src.data'),
+            ('dbid', offset),
+        )
+        (dstColumns, srcColumns) = unzip(columns)
+        
+        srcTables = (
+            '%s.bucket b1' % dstPrefix,
+            '%s.user_blob src' % srcPrefix,
+        )
+        
+        kwds = {
+            'where'      : 'b1.data_id = %s' % offset,
+            'orderBy'    : 'src.dbid ASC',
+            'dstTable'   : '%s.user_blob' % dstPrefix,
+            'srcTables'  : ',\n    '.join(srcTables),
+            'dstColumns' : ',\n    '.join(dstColumns),
+            'srcColumns' : ',\n    '.join(srcColumns),
+        }
+        
+        yield findSql('mergeEntity') % kwds        
+                
+@api.cache
+def __getAffectedIndexes(destSession):
+    vendor = destSession.getDatabaseVendor()
+    if vendor != SQLServer:
+        return ()
+    dstDb = destSession.db()
+    prefix = destSession.getTablePrefix()
     
-    kwds = {
-        'where'    : where,
-        'srcTable' : srcTable,
-        'dstTable' : dstTable,
-        'srcColumns' : ',\n    '.join(srcColumns),
-        'dstColumns' : ',\n    '.join(dstColumns),
-        'dbidColumn' : dbidColumn,
-        'addOldDbId' : addOldDbId,
-        'entityDbName': entityDbName,
-        'destSession': destSession,
-        'sourceSession': sourceSession,
-    }
-    return kwds
+    return [
+        (index, '%s.%s' % (prefix, table))
+            for table in dstDb.tables()
+                for index in dstDb.indexes(table)
+                    if table != __statelessDbIdMapTableName and
+                       not index.endswith('_cix')
+    ]
+
+@api.cache
+def __getClusteredIndexes(destSession):
+    vendor = destSession.getDatabaseVendor()
+    if vendor != SQLServer:
+        return ()
+    dstDb = destSession.db()
+    prefix = destSession.getTablePrefix()
+    
+    return [
+        ('%s_cix' % e.db_name, '%s.%s' % (prefix, e.db_name))
+            for e in destSession.getAllEntityDefs()
+    ]
+    
+def _disableIndexes(destSession, *args):
+    if destSession.getDatabaseVendor() == SQLServer:
+        
+        if __useClusteredIndexes:
+            for i in __getClusteredIndexes(destSession):
+                yield 'CREATE UNIQUE CLUSTERED INDEX %s ON %s (dbid) ' \
+                      'WITH (DROP_EXISTING = ON, FILL_FACTOR = %d)' %  \
+                        tuple(chain(i, (__defaultFillFactor,)))
+            
+        else:
+            for i in __getAffectedIndexes(destSession):
+                yield 'ALTER INDEX %s ON %s DISABLE' % i
+        
+def _rebuildIndexes(destSession, *args):
+    if destSession.getDatabaseVendor() == SQLServer:
+        
+        if __useClusteredIndexes:
+            indexes = chain(__getClusteredIndexes(destSession),
+                            __getAffectedIndexes(destSession))
+                            
+            for i in indexes:
+                yield 'ALTER INDEX %s ON %s REBUILD' % i
+            
+        else:
+            for i in __getAffectedIndexes(destSession):
+                yield 'ALTER INDEX %s ON %s REBUILD' % i
+
+def _finaliseDbGlobal(destSession, sourceSessions, dbidOffsets):
+    prefix = destSession.getTablePrefix()
+    last = dbidOffsets[-1]
+    sql = 'UPDATE %s.dbglobal SET next_request_id = %d, next_aux_id = %d'
+    return sql % (prefix, last, last)
+        
+def _mergeDatabases(destSession, sourceSessions):
+    
+    dbidOffsets = getDbIdOffsets(destSession, sourceSessions)
+    args = (destSession, sourceSessions, dbidOffsets)
+    sql  = [
+        _setPreMergeDatabaseOptions(*args),
+        _prepareDatabaseForMerge(*args),
+        _createStatelessDbIdMap(*args),
+        _createUserBucketMap(*args),
+    ]
+    sql += [ s for s in _disableIndexes(*args) ]
+    sql += [ s for s in _mergeEntities(*args) ]
+    sql += [ s for s in _mergeParentChildLinks(*args) ]
+    sql += [ s for s in _mergeHistory(*args) ]
+    sql += [ s for s in _mergeAttachments(*args) ]
+    sql += [ s for s in _mergeUserBuckets(*args) ]
+    sql += [ s for s in _rebuildIndexes(*args) ]
+    sql += [ 
+        _finaliseDbGlobal(*args),
+        _setPostMergeDatabaseOptions(*args),
+    ]
+    
+    return '\nGO\n'.join(sql)
+        
+def _setPreMergeDatabaseOptions(destSession, *args):
+    k = { 'dbName' : destSession.getPhysicalDatabaseName() }
+    return str(findSql('setPreMergeDatabaseOptions') % k)
+
+def _setPostMergeDatabaseOptions(destSession, *args):
+    k = { 'dbName' : destSession.getPhysicalDatabaseName() }
+    return (findSql('setPostMergeDatabaseOptions') % k)
+    
+def mergeDatabases(destSession, sourceSessions):
+    dstDb = destSession.db()
+    sql = _mergeDatabases(destSession, sourceSessions)
+    
+    for session in sourceSessions:
+        destSession.updateDynamicLists(session.getDynamicLists())
+    
+    mergePublicQueries(destSession, sourceSessions)
+        
+def mergePublicQueries(destSession, sourceSessions):
+    cwd = os.getcwd()
+    for session in sourceSessions:
+        name = session._databaseName
+        path = '%s-queries.bkt' % name
+        if not os.path.isfile(joinPath(cwd, path)):
+            exportQueries(session, path)
+        updateQueries(destSession, path)
+    
+class DatabaseNotEmptyError(Exception): pass
+
+def _prepareDatabaseForMerge(destSession, *args):
+    """
+    Deletes all rows (except for where dbid == 0) in the following tables:
+    parent_child_links, users, groups, bucket, user_blob.
+    """
+    
+    # This method should only be run against sessions for databases that have
+    # been newly created from Designer, which we can verify by seeing if there
+    # are any entities present.
+    if getMaxStatefulEntityDbIds((destSession,)).next() != 0:
+        raise DatabaseNotEmptyError()
+    
+    kwds = { 'dstPrefix' : destSession.getTablePrefix() }
+    return findSql('prepareDatabaseForMerge', **kwds)
+    
 
 def addMergeFields(adminSession, destSession):
     """
@@ -166,6 +1014,10 @@ def addMergeFields(adminSession, destSession):
         entityDefName = entityDef.GetName()
         fields = listToMap(entityDef.GetFieldDefNames()).keys()
         for (mergeField, mergeFieldType) in MergeFields.items():
+            # Ugh, quick hack...
+            if mergeField.endswith('_id') and \
+               entityDef.GetType() == api.EntityType.Stateless:
+                continue
             if mergeField not in fields:
                 print "adding field '%s' of type '%s' to entity '%s'..." % (   \
                     mergeField,
@@ -194,8 +1046,8 @@ def addMergeFields(adminSession, destSession):
     designer.ValidateSchema()
     print "checking in schema..."
     designer.CheckinSchema('Added fields for database merge.')
-    print "upgrading database '%s'..." % destSession._databaseName
-    designer.UpgradeDatabase(destSession._databaseName)
+    #print "upgrading database '%s'..." % destSession._databaseName
+    #designer.UpgradeDatabase(destSession._databaseName)
     designer.Logoff()
     del designer
     
@@ -220,462 +1072,172 @@ def getRecommendedStatefulDbIdOffset(session):
     recommended = str(int(m[0])+1) + '0' * (len(m)-1)
     return int(recommended)
 
+def getDbIdOffsets(destSession, sourceSessions):
+    """
+    Enumerates over the given list of sourceSessions and constructs a list of
+    offsets that should be used when merging the contents of each session's
+    database into the destSession's database.  The length of the list of offsets
+    returned will be len(sourceSessions)+1.  This is because an extra offset is
+    added to the end of the list that represents what dbglobal.next_request_id
+    and dbglobal.next_aux_id should be set to in destSession when all source
+    sessions have been merged in.
+    
+    @param destSession: L{api.Session} object.
+    @param sourceSessions: enumerable container of L{api.Session} objects.
+    @returns: L{list} of L{int}s.
+    """
+    offsets = list()
+    
+    # Is our destination session an empty database?  We detect this by whether
+    # or not there are any stateful entities present.
+    if getMaxStatefulEntityDbIds((destSession,)).next() == 0:
+        offsets.append(0)
+        sessions = sourceSessions
+    else:
+        sessions = chain((destSession,), sourceSessions)
+        
+    previous = 0
+    count = itertools.count(1)
+    for maximum in getMaxTableDbIds(sessions):
+        if maximum == 0:
+            offsets.append(0)
+        else:
+            m = str((maximum + previous) - 33554432)
+            prefix = count.next()
+            zeroes = len(m) if prefix == 1 else len(m)-1
+            offset = int('%d%s' % (prefix, '0' * zeroes))
+            offsets.append(offset)
+            previous = offset
+    
+    return offsets
+
+def getMaxTableDbIds(sessions):
+    tables = list()
+    firstSession = True
+    for session in sessions:
+        maximum = 0
+        dbc = session.db()
+        if firstSession:
+            # Get a list of all the tables, then reduce to those that have a
+            # dbid column of type int.
+            for table in dbc.tables():
+                # ratl_replicas has a dbid column, but it references a master
+                # dbid value in the schema, which we don't care about.
+                if table in ('ratl_replicas', __statelessDbIdMapTableName):
+                    continue
+                for column in dbc.columns(table):
+                    if column[0] == u'dbid' and column[2] == u'int':
+                        tables.append(table)
+                        break
+            firstSession = False
+            
+        for table in tables:
+            sql = 'SELECT MAX(dbid) FROM %s' % table
+            mx = dbc.selectSingle(sql)
+            if mx > maximum:
+                maximum = mx
+        
+        yield maximum
+
+def _getMaxEntityDbIds(sessions, getEntityDefMethod):
+    for session in sessions:
+        maximum = 0
+        dbc = session.db()
+        for entityDef in getEntityDefMethod(session):
+            table = entityDef.GetDbName()
+            # ratl_replicas has a dbid column, but it references a master
+            # dbid value in the schema, which we don't care about.
+            if table == 'ratl_replicas':
+                continue
+            sql = 'SELECT MAX(dbid) FROM %s' % table
+            mx = dbc.selectSingle(sql)
+            if mx > maximum:
+                maximum = mx
+        
+        yield maximum
+
+def getMaxEntityDbIds(sessions):
+    return _getMaxEntityDbIds(sessions, api.Session.getAllEntityDefs)
+
+def getMaxStatefulEntityDbIds(sessions):
+    return _getMaxEntityDbIds(sessions, api.Session.getStatefulEntityDefs)
+
+def getMaxStatelessEntityDbIds(sessions):
+    return _getMaxEntityDbIds(sessions, api.Session.getStatelessEntityDefs)
+
+def isValidDbIdOffset(sessions, dbidOffset):
+    maximum = getMaxDbId(sessions)
+    return bool(dbidOffset > maximum)
+
 def getMaxIdForField(session, table, column):
     db = session.db().selectSingle('SELECT MAX(%s) FROM %s' % (column, table))
 
-def getDbIdOffsets(destSession, session):
-    dbidOffsets = dict()
-    for table in getTargets(api.EntityDef.GetDbName):
-        if table in ('attachments_blob', 'ratl_replicas'):
-            continue
-        offset = dstDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
-        if not offset:
-            offset = 0
-        if offset > 0:
-            offset -= 33554432
-        dbidOffsets[table] = offset
-    
-    statefulDbIdOffset = getRecommendedStatefulDbIdOffset(destSession)
-    dbidOffsets.update(
-        zip([e.GetDbName() for e in destSession.getStatefulEntityDefs()], 
-            repeat(statefulDbIdOffset))
-    )
-
-def bulkCopy(destSession, sourceSessions, output=StringIO.StringIO(),
-             mergeFields=MergeFields):
-    
-    if mergeFields:
-        # Every entityDef in destSession should have all merge fields.
-        for entityDef in destSession.getAllEntityDefs():
-            fields = listToMap(entityDef.GetFieldDefNames())
-            for expected in mergeFields.keys():
-                if expected not in fields:
-                    raise RuntimeError("entity '%s' is missing field '%s', "   \
-                                       "run addMergeFields() first" %          \
-                                       (entityDef.GetName(), expected))
-    
-
-    preCopySql  = []
-    bulkCopySql = []
-    postCopySql = []
-    enableIndexesSql = []
-    disableIndexesSql = []
-    
-    dstReplicaId = destSession.getReplicaId()
-    dstPrefix = destSession.getTablePrefix()
-    dstDb = destSession.db()
-    
-    straightCopyTargets = (
-        u'history',
-        u'attachments',
-        u'attachments_blob',
-        u'parent_child_links',
-    )
-    getTargets = lambda method: list(straightCopyTargets) + [
-        method(e) for e in destSession.getAllEntityDefs()
-            if method(e) not in straightCopyTargets
-    ]
-    targets = getTargets(api.EntityDef.GetName)
-    
-    dbidOffsets = dict()
-    for table in getTargets(api.EntityDef.GetDbName):
-        if table in ('attachments_blob', 'ratl_replicas'):
-            continue
-        offset = dstDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
-        if not offset:
-            offset = 0
-        if offset > 0:
-            offset -= 33554432
-        dbidOffsets[table] = offset
-    
-    statefulDbIdOffset = getRecommendedStatefulDbIdOffset(destSession)
-    dbidOffsets.update(
-        zip([e.GetDbName() for e in destSession.getStatefulEntityDefs()], 
-            repeat(statefulDbIdOffset))
-    )
-    
-
-    (userEntityDefId, groupsFieldDefId) =                       \
-        dstDb.selectAll(                                        \
-            "SELECT e.id, f.id FROM fielddef f, entitydef e "   \
-            "WHERE e.name = 'users' AND f.name = 'groups' AND " \
-            "f.entitydef_id = e.id"                             \
-        )[0]
-    
-    preCopySql.append(findSql('bulkCopy.setPreCopyDatabaseOptions', **{
-        'destSession'  : destSession
-    }))
-    
-    emptyDb = False
-    firstSession = True
-    sessionCounter = itertools.count(1)
-    for sourceSession in sourceSessions:
-        sessionCount = sessionCounter.next()
-        if sessionCount > 1:
-            emptyDb = False
-            firstSession = False
-            previousSession = sourceSessions[sessionCount-2]
-            dbidOffsets = dict()
-            prevDb = previousSession.db()
-            for table in getTargets(api.EntityDef.GetDbName):
-                if table in ('attachments_blob', 'ratl_replicas'):
-                    continue
-                offset = prevDb.selectSingle('SELECT MAX(dbid) FROM %s' % table)
-                if not offset:
-                    offset = 0
-                if offset > 0:
-                    offset -= 33554432+1
-                dbidOffsets[table] = offset
-            
-            statefulDbIdOffset = getRecommendedStatefulDbIdOffset(\
-                previousSession)
-            
-            dbidOffsets.update(zip([
-                    e.GetDbName() for e in destSession.getStatefulEntityDefs()
-                ], repeat(statefulDbIdOffset))
-            )
-        else:
-            firstSession = True
-            previousSession = None
-            dbidOffsets = dict()
-            # Crude check to see if 'destSession' is pointing to an empty (i.e.
-            # newly created) ClearQuest database by seeing whether or not the
-            # default entity has any records.
-            if destSession.GetDefaultEntityDef().getCount() == 0:
-                emptyDb = True
-            else:
-                # Assume that 'destSession' has been restored from another db
-                # backup.  Update dbglobal and ratl_replicas such that they
-                # reflect the destination database's intended values.
-                preCopySql.append(                                             \
-                    "UPDATE %s.dbglobal SET site_name = '%s'" %                \
-                    (dstPrefix, destSession._databaseName)
-                )
-                preCopySql.append(                                             \
-                    "UPDATE %s.ratl_replicas SET family = '%s' "               \
-                    "WHERE dbid <> 0" %                                        \
-                        (dstPrefix, destSession._databaseName)
-                )
-                for entityDef in destSession.getAllEntityDefs():
-                    try:
-                        if not entityDef.GetFieldDefType('id') == FieldType.Id:
-                            continue
-                    except com_error:
-                        continue
-                    else:
-                        preCopySql.append(\
-                            findSql('bulkCopy.updateIds', **{
-                                'dstTable'  : entityDef.GetDbName(),
-                                'dstPrefix' : dstPrefix,
-                                'replicaId' : dstReplicaId,
-                            })
-                        )
-                    
-        sourceReplicaId = str(sourceSession.getReplicaId())
-        
-        for target in targets:
-            if target in straightCopyTargets:
-                straightCopy = True
-                tableName = target
-                entityDef = None
-                entityDefName = None
-                entityType = None
-                isStatefulEntity= False
-            else:
-                straightCopy = False
-                entityDef = destSession.GetEntityDef(target)
-                entityDefName = entityDef.GetName()
-                entityType= entityDef.GetType()
-                isStatefulEntity = entityDef.GetType() == EntityType.Stateful
-                tableName = entityDef.GetDbName()
-            
-            dstTable = '.'.join((dstPrefix, tableName))
-            srcPrefix = sourceSession.getTablePrefix()
-            srcTable = '.'.join((srcPrefix, tableName))
-            
-            dbidOffset = dbidOffsets.get(tableName) or 0
-            
-            if firstSession:
-                disableIndexesSql.append('\nGO\n'.join([
-                    'ALTER INDEX %s ON %s DISABLE' % (index, dstTable)
-                        for index in dstDb.getIndexes(tableName)
-                ]))
-                
-                enableIndexesSql.append('\nGO\n'.join([
-                    'ALTER INDEX %s ON %s REBUILD' % (index, dstTable)
-                        for index in dstDb.getIndexes(tableName)
-                ]))
-                
-            exclude = [
-                'dbid',
-                'ratl_keysite',
-                'ratl_mastership',
-                'lock_version', 
-                'locked_by',
-            ]
-            if mergeFields:
-                exclude += [ key for key in mergeFields.keys() ]
-                
-            columns = [
-                (c[3], 'src.%s' % c[3])
-                    for c in dstDb.cursor().columns(table=tableName).fetchall()
-                        if c[3] not in exclude
-            ]
-            
-            if target in ('attachments_blob', 'parent_child_links'):
-                orderBy = ''
-                dbidColumn = ''
-                where = ''
-                if target == 'parent_child_links':
-                    where = "WHERE NOT (src.parent_entitydef_id = %d AND "     \
-                            "src.child_entitydef_id = %d AND "                 \
-                            "src.parent_fielddef_id = %d AND "                 \
-                            "src.child_fielddef_id = 0 AND "                   \
-                            "src.link_type_enum = 1)" %                        \
-                                (userEntityDefId,                              \
-                                 userEntityDefId,                              \
-                                 groupsFieldDefId)
-                    
-            else:
-                where = 'WHERE src.dbid <> 0'
-                orderBy = 'ORDER BY src.dbid ASC'
-                
-                if emptyDb:
-                    dbidColumn = 'src.dbid'
-                else:
-                    dbidColumn = '(src.dbid + %d)' % dbidOffset
-                if not straightCopy and \
-                       entityDef.GetType() == EntityType.Stateless:
-                    where += ' AND NOT EXISTS (%s)' % \
-                             entityDef                \
-                                .getUniqueKey()       \
-                                ._lookupDbIdFromForeignSessionSql('src.dbid',
-                                                                  sourceSession)
-                
-            columns += [ ('ratl_mastership', sourceReplicaId) ]
-            if target in ('attachments_blob', 'parent_child_links'):
-                addReplicaColumn = True
-            else:
-                addReplicaColumn = False
-                columns += [ ('dbid', dbidColumn), ]
-                if mergeFields:
-                    columns += [
-                        (__orig_db, "'%s'" % sourceSession._databaseName),
-                        (__orig_dbid, 'src.dbid'),
-                        (__orig_id, ('src.id' if isStatefulEntity else 'NULL')),
-                    ]
-            
-            dstColumns = [ c[0] for c in columns ]
-            srcColumns = [ c[1] for c in columns ]
-            
-            kwds = {
-                'where'    : where,
-                'orderBy'  : orderBy,
-                'srcTable' : srcTable,
-                'dstTable' : dstTable,
-                'tableName': tableName,
-                'srcColumns' : ',\n    '.join(srcColumns),
-                'dstColumns' : ',\n    '.join(dstColumns),
-                'addReplicaColumn' : addReplicaColumn,
-            }
-            bulkCopySql.append(findSql('bulkCopy', **kwds))
-            
-            if straightCopy or entityDefName in ('users', 'groups'):
-                continue
-            
-            
-            # If we get here, we've generated the SQL necessary for bringing the
-            # entity/table over via a direct insert.  Our next step requires us
-            # to generate SQL for updating the reference fields present on the
-            # table, then reference lists in parent_child_links, then entries
-            # in attachments_blob that are pointing to us, then history table
-            # entries.
-            
-            updates = dict()
-            for f in entityDef.getReferenceFieldNames():
-                if f in ('ratl_keysite', 'ratl_mastership'):
-                    continue
-                
-                r = entityDef.GetFieldReferenceEntityDef(f)
-                if emptyDb and r.GetName() not in ('users', 'groups'):
-                    continue
-            
-                column = entityDef.getFieldDbName(f)
-                if r.GetType() == EntityType.Stateful:
-                    newDbId = '%s + %s' % (column, dbidOffset)
-                else:
-                    newDbId = r.getUniqueKey() \
-                               ._lookupDbIdFromForeignSessionSql(
-                                    column, sourceSession)
-                               
-                updates[column] = '(CASE WHEN %s = 0 THEN 0 ELSE (%s) END)' %  \
-                                   (column, newDbId)
-                                   
-            if updates:
-                postCopySql.append(                                 \
-                    "UPDATE %s SET %s WHERE ratl_mastership = %s" % \
-                    (dstTable,
-                     ', '.join(['%s = %s' % i for i in updates.items() ]),
-                     sourceReplicaId)
-                )
-            
-            # If we're dealing with a stateful entitydef, add another SQL stmt
-            # to update the id to match the new dbid.
-            if entityDef.GetType() == EntityType.Stateful:
-                postCopySql.append(\
-                    findSql('bulkCopy.updateIdsFromDbIds', **{
-                        'dstTable'          : dstTable,
-                        'dstPrefix'         : dstPrefix,
-                        'sourceReplicaId'   : sourceReplicaId,
-                    })
-                )
-            
-            # Repeat for reference lists.  We need to generate two types of SQL
-            # statements: one that takes care of forward references (parent_-
-            # entitydef_id will match our entitydef id) and back references 
-            # (child_entitydef_id will match our entitydef id).
-            
-            updates = dict()
-            kwds = {
-                'dstTable'          : dstTable,
-                'dstPrefix'         : dstPrefix,
-                'entityDefName'     : entityDefName,
-                'sourceReplicaId'   : sourceReplicaId,
-            }
-            referenceListFields = [
-                ('parent', entityDef.getReferenceListFieldNames()),
-                ('child',  entityDef.getBackReferenceListFieldNames()),
-            ]
-            for (scope, fields) in referenceListFields:
-                kwds['scope'] = scope
-                for f in fields:
-                    
-                    r = entityDef.GetFieldReferenceEntityDef(f)
-                    if emptyDb and r.GetName() not in ('users', 'groups'):
-                        continue
-                
-                    column = '%s_dbid' % scope
-                    if r.GetType() == EntityType.Stateful:
-                        newDbId = '%s + %s' % (column, dbidOffset)
-                    else:
-                        newDbId = r.getUniqueKey() \
-                                   ._lookupDbIdFromForeignSessionSql(
-                                        column, sourceSession)
-                                   
-                    kwds['newDbId'] = newDbId
-                    kwds['fieldDefName'] = f
-                    postCopySql.append(\
-                        findSql('bulkCopy.updateParentChildLinks', **kwds),
-                    )
-            
-            # If we're an empty database, we don't need to update any history or
-            # attachment fields, so continue at this point.
-            if emptyDb:
-                continue
-            
-            attachmentsDbIdOffset = dbidOffsets['attachments']
-            kwds = {
-                'dstTable'  	: dstTable,
-                'dstPrefix' 	: dstPrefix,
-                'dbidOffset'    : dbidOffset,
-                'entityDefName' : entityDefName,
-                'sourceReplicaId': sourceReplicaId,
-                'attachmentsDbIdOffset' : attachmentsDbIdOffset
-            }
-            postCopySql.append(findSql('bulkCopy.updateHistory', **kwds))
-            
-            # Update attachments & attachments_blob.
-            postCopySql.append(findSql('bulkCopy.updateAttachments', **kwds))
-            
-            # And finally, update ratl_mastership, indicating that this entity
-            # has now been merged completely into the destination database.
-            postCopySql.append(                                                \
-                "UPDATE %s SET ratl_mastership = %d WHERE dbid <> 0 "          \
-                "AND ratl_mastership <> %d" %                                  \
-                    (dstTable,
-                     dstReplicaId,
-                     dstReplicaId)
-            )
-            
-        if not emptyDb:
-            postCopySql.append("DELETE %s.history WHERE ratl_mastership = %s" %\
-                               (dstPrefix, sourceReplicaId))
-            postCopySql.append(                                                \
-                "DELETE %s.parent_child_links WHERE ratl_mastership = %s" %    \
-                    (dstPrefix, sourceReplicaId)
-            )
-            postCopySql.append(\
-                findSql('bulkCopy.updateAttachmentBlobs', **{
-                    'dstTable'  : dstTable,
-                    'dstPrefix' : dstPrefix,
-                    'dbidOffset': dbidOffset,
-                    'sourceReplicaId': sourceReplicaId,
-                    'attachmentsDbIdOffset' : attachmentsDbIdOffset
-                })
-            )
-            allEntityDefs = destSession.getAllEntityDefs()
-
-    
-    getMaxDbIdSql = lambda method:                                             \
-        'SELECT TOP 1 ((dbid+1)-0x2000000) FROM (%s) AS x ORDER BY dbid DESC' %\
-            ' UNION '.join([                                                   \
-                'SELECT MAX(dbid) AS dbid FROM %s' % entityDef.GetDbName()     \
-                    for entityDef in method(destSession)                       \
-            ])
-        
-    postCopySql.append(
-        'UPDATE %s.dbglobal SET next_request_id = (%s), next_aux_id = (%s)' % (
-            dstPrefix,
-            getMaxDbIdSql(api.Session.getStatefulEntityDefs),
-            getMaxDbIdSql(api.Session.getStatelessEntityDefs)
-        )
-    )
-    
-    postCopySql.append(\
-        findSql('bulkCopy.setPostCopyDatabaseOptions', **{
-            'destSession' : destSession,
-        })
-    )
-    
-    output.write('\nGO\n'.join([
-        '\nGO\n'.join([
-            line for line in section
-        ]) for section in (
-            disableIndexesSql,
-            preCopySql,
-            bulkCopySql,
-            postCopySql,
-            enableIndexesSql
-        )
-    ]))
-    
-    return output
 
 #===============================================================================
 # Classes
 #=============================================================================== 
 
-class MergeManager(TaskManager):
+class MergeConfig(TaskManagerConfig):
     def __init__(self, manager):
-        Task.__init__(self, manager)
-        self.defaultConfigSection = 'DEFAULT' \
-            if len(sys.argv) == 1             \
-            else sys.argv[1]
-            
-            
+        self.defaultConfigSection = manager.profile
+        TaskManagerConfig.__init__(self, manager)
+        print "file: %s" % self.file
+        
     def getDefaultConfigSection(self):
         return self.defaultConfigSection
-
+    
+    def tasks(self):
+        return [
+            InitialisePhysicalDatabase,
+            InitialiseLogicalDatabase,
+            MergeDatabases,
+            VerifyMerge,
+        ]
+        
+class MergeManager(MultiSessionTaskManager):
+    def __init__(self, profile='DEFAULT'):
+        self.profile = profile
+        MultiSessionTaskManager.__init__(self)
+            
     def run(self):
         
-        self.mergeNonExistingStatelessEntities()
-        pass
+        for task in self.tasks:
+            t = task(self)
+            t.run()
+            # Keep a copy of the task so other tasks can access it.
+            self.task[t.__class__.__name__] = t    
+    
+    def createConfig(self):
+        return MergeConfig(self)
         
 
 class MergeTask(Task):
     def __init__(self, manager):
         Task.__init__(self, manager)
-        self.sourceSession=manager.getSourceSession(SessionClassType.User)
+        self.sourceSessions = manager.getSourceSessions()
+    
+    def getSessionClassType(self):
+        return api.SessionClassType.User
+
+class InitialisePhysicalDatabase(MergeTask):
+    def run(self):
+        print "Running InitialisePhysicalDatabase()..."
+        pass
+
+class InitialiseLogicalDatabase(MergeTask):
+    def run(self):
+        print "Running InitialiseLogicalDatabase()..."
+        pass
+
+class MergeDatabases(MergeTask):
+    def run(self):
+        print "Running MergeDatabases()..."
+        pass
+
+class VerifyMerge(MergeTask):
+    def run(self):
+        print "Running VerifyMerge()..."
+        pass
 
 class DisableEntityIndexesTask(MergeTask):
     def __init__(self, manager, entityDefName):

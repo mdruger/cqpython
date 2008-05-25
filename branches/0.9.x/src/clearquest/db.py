@@ -1,13 +1,15 @@
+import os
 import sys
 import dbi
 import pyodbc as odbc
+from subprocess import Popen, PIPE
 from functools import wraps
 from inspect import ismethod, isfunction
 from os.path import dirname, isfile
 from win32api import RegCloseKey, RegOpenKeyEx, RegQueryValueEx
 from win32con import HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE
 from genshi.template import TemplateLoader, TextTemplate
-from clearquest.util import listToMap, joinPath, cache
+from clearquest.util import listToMap, joinPath, cache, Dict, readRegKey
 from clearquest.constants import DatabaseVendor
 
 #===============================================================================
@@ -34,57 +36,10 @@ _SqlLoader = TemplateLoader(_SqlTemplateDir,
                             variable_lookup='strict',
                             auto_reload=True)
 
-def getConnectOptionsFromRegistry(dbset, db):
-    """
-    @param dbset: L{str} database set name (e.g. 'Classics')
-    @param db:    L{str} database name (e.g. 'CLSIC')
-    @return: L{str} a string representing the connect options for the given
-             database set and database (or an empty string if none are present)
-    """
-    # Get the 'CurrentVersion' of ClearQuest from the registry.
-    path = 'Software\\Rational Software\\ClearQuest'
-    try:
-        key = RegOpenKeyEx(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE)
-    except:
-        raise
-    else:
-        try:
-            ver, dummy = RegQueryValueEx(key, 'CurrentVersion')
-        except:
-            raise
-        else:
-            if not ver:
-                raise RuntimeError, 'No value for HKLM\\%s\\%s' % \
-                                    (path, 'CurrentVersion')
-        finally:
-            RegCloseKey(key)
-    
-    # Now get the 'ConnectOptions' string.
-    path = '%s\\%s\\Core\\Databases\\%s\\%s' % (path, ver, dbset, db) 
-    try:
-        key = RegOpenKeyEx(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE)
-    except:
-        raise
-    else:
-        try:
-            connectOptions, dummy = RegQueryValueEx(key, 'ConnectOptions')
-        except:
-            raise
-        finally:
-            RegCloseKey(key)        
-    
-    return connectOptions
+#===============================================================================
+# Decorators
+#===============================================================================
 
-def _findSql(session, classOrModuleName, methodName, *args, **kwds):
-    vendor = session.getDatabaseVendorName()
-    fileName = '%s.%s.%s.sql' % (classOrModuleName, methodName, vendor)
-    if not isfile(joinPath(_SqlTemplateDir, fileName)):
-        fileName = '%s.%s.sql' % (classOrModuleName, methodName)
-    
-    return _SqlLoader.load(fileName) \
-                     .generate(args=args, **kwds) \
-                     .render('text')
-                     
 def sql(mf):
     @wraps(mf)
     def decorator(f):
@@ -131,6 +86,96 @@ def execute(f): pass
 @sql
 def getSql(f): pass
 
+#===============================================================================
+# Helper Methods
+#===============================================================================
+
+def getConnectOptionsFromRegistry(dbset, db):
+    """
+    @param dbset: L{str} database set name (e.g. 'Classics')
+    @param db:    L{str} database name (e.g. 'CLSIC')
+    @return: L{str} a string representing the connect options for the given
+             database set and database (or an empty string if none are present)
+    """
+    # Get the 'CurrentVersion' of ClearQuest from the registry.
+    path = 'Software\\Rational Software\\ClearQuest'
+    try:
+        key = RegOpenKeyEx(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE)
+    except:
+        raise
+    else:
+        try:
+            ver, dummy = RegQueryValueEx(key, 'CurrentVersion')
+        except:
+            raise
+        else:
+            if not ver:
+                raise RuntimeError, 'No value for HKLM\\%s\\%s' % \
+                                    (path, 'CurrentVersion')
+        finally:
+            RegCloseKey(key)
+    
+    # Now get the 'ConnectOptions' string.
+    path = '%s\\%s\\Core\\Databases\\%s\\%s' % (path, ver, dbset, db) 
+    try:
+        key = RegOpenKeyEx(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE)
+    except:
+        raise
+    else:
+        try:
+            connectOptions, dummy = RegQueryValueEx(key, 'ConnectOptions')
+        except:
+            raise
+        finally:
+            RegCloseKey(key)        
+    
+    return connectOptions
+
+#===============================================================================
+# Private Methods
+#===============================================================================
+
+def _findSql(session, classOrModuleName, methodName, *args, **kwds):
+    vendor = session.getDatabaseVendorName()
+    fileName = '%s.%s.%s.sql' % (classOrModuleName, methodName, vendor)
+    if not isfile(joinPath(_SqlTemplateDir, fileName)):
+        fileName = '%s.%s.sql' % (classOrModuleName, methodName)
+    
+    return _SqlLoader.load(fileName) \
+                     .generate(args=args, **kwds) \
+                     .render('text')
+
+def _getSqlCmdExe():
+    p = 'Software/Microsoft/Microsoft SQL Server/90/Tools/ClientSetup/Path'
+    exe = joinPath(readRegKey(p), 'sqlcmd.exe')
+    if not os.path.isfile(exe):
+        raise RuntimeError("sqlcmd.exe does not exist at: %s" % exe)
+    return exe
+
+def _sqlcmd(session, sql, stdout=PIPE, stderr=PIPE):
+    conf = Dict(session.connectStringToMap())
+    f = open(r'c:\temp\foo.sql', 'w').write(sql)
+    args = (
+        _getSqlCmdExe(),
+        '-U',   conf.UID,
+        '-P',   conf.PWD,
+        '-S',   conf.SERVER,
+        '-d',   conf.DB,
+        '-r', '1', # Redirect everything to stderr
+        '-b',      # Return immediately when an error occurs
+        '-i', r'C:\temp\foo.sql',
+    )
+    print 'running:\n%s' % ' '.join(args)
+    return
+    p = Popen(args, stdout=PIPE, stderr=PIPE)
+    p.wait()
+    return p
+    
+
+#===============================================================================
+# Classes
+#===============================================================================
+                     
 class Connection(object):
     def __init__(self, parent):
         self._parent = parent
@@ -182,7 +227,7 @@ class Connection(object):
         cursor = self._execute(sql, *args)
         description = [ d[0] for d in cursor.description ]
         results = cursor.fetchall()
-        return [ dict(zip(description, row[0])) for row in results ]
+        return [ dict(zip(description, row)) for row in results ]
     
     def selectSingle(self, sql, *args):
         cursor = self._execute(sql, *args)
@@ -232,33 +277,47 @@ class Connection(object):
     def getTablePrefix(self):
         return self._parent.getTablePrefix()
     
+    def getDboTablePrefix(self):
+        if self.getDatabaseVendor() != DatabaseVendor.SQLServer:
+            raise NotImplementedError
+        else:
+            return '%s.%s'.lower() % (self.catalog(), 'dbo')
+            
     def columns(self, tableName):
         return [ 
             (c[3].lower(),) + c[4:]
                 for c in self.cursor()
-                             .columns(schema=self.getSchema(),
-                                      catalog=self.getCatalog(),
+                             .columns(schema=self.schema(),
+                                      catalog=self.catalog(),
                                       table=tableName.upper()).fetchall()
         ]
     
-    def getIndexes(self, table):
+    def tables(self):
+        return [
+            t[2] for t in
+                self.cursor().tables(schema=self.schema(),
+                                     catalog=self.catalog()).fetchall()
+        ]
+    
+    def indexes(self, table):
         return listToMap([
             i[5] for i in self.cursor()
                               .statistics(table,
-                                          schema=self.getSchema(),
-                                          catalog=self.getCatalog()).fetchall()
+                                          schema=self.schema(),
+                                          catalog=self.catalog()).fetchall()
                                               if i[5] is not None
         ]).keys()
-    
+
     @cache
-    def getCatalog(self):
+    def catalog(self):
         p = self.getTablePrefix()
         return p.split('.')[0].upper() if '.' in p else ''
     
     @cache
-    def getSchema(self):
+    def schema(self):
         p = self.getTablePrefix()
         return p.split('.')[1].upper() if '.' in p else p
         
     def __getattr__(self, attr):
         return getattr(self._con, attr)
+    
