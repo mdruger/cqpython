@@ -3,8 +3,7 @@
 # By python version 2.5.1 (r251:54863, May  1 2007, 17:47:05) [MSC v.1310 32 bit (Intel)]
 # From type library 'cqole.dll'
 # On Fri Nov 02 19:34:26 2007
-from clearquest.util import connectStringToMap
-""""""
+
 makepy_version = '0.4.95'
 python_version = 0x20501f0
 
@@ -424,6 +423,15 @@ class CQWorkspaceItem(CQObject):
     def __init__(self, *args, **kwds):
         CQObject.__init__(self, *args, **kwds)
         addWorkspaceItemNature(self)
+    
+    def __eq__(self, other):
+        """
+        Must be overridden by subclasses.
+        """
+        raise NotImplementedError
+    
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
 class CQIterator(object):
     def __call__(self, iterator, *args, **kwds):
@@ -522,7 +530,7 @@ class SchemaObjectProxy(CQProxyObject):
     def getProxiedFields(self):
         fields = listToMap(self._proxiedObject._prop_map_put_.keys())
         fields.update(listToMap(self._proxiedObject._prop_map_get_.keys()))
-        for ex in '_prop_map_put_ex_', '_prop_map_get_ex_':
+        for ex in ('_prop_map_put_ex_', '_prop_map_get_ex_'):
             try:
                 extended = getattr(self._proxiedObject, ex)
             except AttributeError:
@@ -2841,7 +2849,9 @@ class Folder(CQWorkspaceItem):
     
     def getChildWorkspaceItems(self):
         ws = self.workspace
-        items = lambda t: ws.GetWorkspaceItemDbIdList(0, t, self.dbid, '') or []
+        def getItems(itemType):
+            ws.GetWorkspaceItemDbIdList(0, itemType, self.dbid, '') or []           
+            
         kwds = {
             'parent'    : self,
             'session'   : self.session,
@@ -2850,7 +2860,7 @@ class Folder(CQWorkspaceItem):
         r = []
         typeMap = WorkspaceItemTypeMap
         for itemType in WorkspaceItemType:
-            for dbid in items(itemType):
+            for dbid in getItems(itemType):
                 kwds['dbid'] = dbid
                 r.append(CQWorkspaceItemXmlProxy(typeMap[itemType], **kwds))
         return r
@@ -5520,6 +5530,7 @@ class Workspace(CQObject):
             )
 
     def SetSession(self, SessionPtr=defaultNamedNotOptArg):
+        self.__dict__['session'] = SessionPtr
         return self._oleobj_.InvokeTypes(1, LCID, 1, (11, 0), ((9, 0),),SessionPtr
             )
 
@@ -5569,6 +5580,39 @@ class Workspace(CQObject):
     _prop_map_put_ = {
         "IsRefreshOnGet" : ((19, LCID, 4, 0),()),
     }
+    
+    def getQueriesMap(self):
+        # return self.session.getQueries()
+        sql = "SELECT dbid, parent_dbid, type, subtype FROM bucket_tool"
+        pending = dict()
+        final = dict()
+        for row in self.session.db().select(sql):
+            pass
+        
+        s = Session()
+        
+        queries = dict()
+        dbids = self.GetAllQueriesList()
+        for dbid in dbids:
+            queryDef = QueryDef(self.GetQueryDefByDbId(dbid))
+            
+        # Does .toXml() work?  Can we diff on XML?  Alternatively, can we 
+            
+            
+        
+        
+            
+            
+            
+            
+        
+        
+        
+    
+        
+        
+        
+        
 
 RecordMap = {
 }
