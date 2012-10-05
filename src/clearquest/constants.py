@@ -3,12 +3,13 @@ class CQConstant(dict):
     def __init__(self):
         items = self.__class__.__dict__.items()
         for (key, value) in filter(lambda t: t[0][:2] != '__', items):
-            self[value] = key
+            if value not in self:
+                self[value] = key
     def __getattr__(self, name):
         return self.__getitem__(name)
     def __setattr__(self, name, value):
-        return self.__setitem__(name, value)            
-    
+        return self.__setitem__(name, value)
+
 class _ActionType(CQConstant):
     Submit      = 1
     Modify      = 2
@@ -125,10 +126,10 @@ FieldType.referenceTypes = (
 FieldType.listTypes = (
     FieldType.ReferenceList,
     FieldType.AttachmentList,
-    FieldType.Journal, 
+    FieldType.Journal,
 )
 FieldType.readOnlyListTypes = (
-    FieldType.Journal,                               
+    FieldType.Journal,
 )
 FieldType.writeableListTypes = (
     FieldType.ReferenceList,
@@ -182,6 +183,7 @@ FieldType.textTypes = (
 )
 class _QueryType(CQConstant):
     List    = 1
+    Query   = 1
     Report  = 2
     Chart   = 3
 QueryType = _QueryType()
@@ -228,13 +230,20 @@ class _WorkspaceItemType(CQConstant):
     Preferences        = 7
     Report             = 9
     ReportFormat       = 10
-    StartupBucketArray = 11    
+    StartupBucketArray = 11
 WorkspaceItemType = _WorkspaceItemType()
 
 WorkspaceItemTypeMap = {
     WorkspaceItemType.Query  : 'QueryDef',
     WorkspaceItemType.Chart  : 'QueryDef',
     WorkspaceItemType.Folder : 'Folder',
+}
+WorkspaceItemTypeToBucketTypeMap = {
+    WorkspaceItemType.Query  : 1,
+    WorkspaceItemType.Chart  : 2, # ???
+    WorkspaceItemType.Chart  : 4,
+    WorkspaceItemType.Report : 256,
+    WorkspaceItemType.ReportFormat : 512,
 }
 
 class _WorkspaceNameOption(CQConstant):

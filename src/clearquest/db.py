@@ -217,6 +217,15 @@ class Connection(object):
         for row in iter(lambda: cursor.fetchone(), None):
             yield dict(zip(description, row))
     
+    def selectAsAttrMap(self, sql, *args):
+        cursor = self._execute(sql, *args)
+        description = [ d[0] for d in cursor.description ]
+        
+        # XXX TODO: use metaclasses to set up light-weight slot-based objects
+        # that allow attribute-based access to columns against each rows.
+        for row in iter(lambda: cursor.fetchone(), None):
+            yield dict(zip(description, row))
+    
     def selectAll(self, sql, *args):
         cursor = self._execute(sql, *args)
         single = len(cursor.description) == 1
